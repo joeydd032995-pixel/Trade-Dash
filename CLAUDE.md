@@ -206,20 +206,27 @@ all layers under a single scored, auditable, agentic intelligence system.
 The MMP is the smallest deliverable that provides real, daily value to a
 quant developer running a live trading operation.
 
-### Phase 1 — Core Signal Loop (MMP v1.0) — **mostly built, needs wiring**
-- [x] Canonical `Event` schema (asset, asset_class, event_type, direction, confidence, timestamp, source, meta)
-- [x] NLP Pipeline: ticker extraction, sentiment, topic, urgency, dedup
-- [x] `CorrelationScorer`: weighted, time-decayed, directional confluence formula
-- [x] `SignalFactory`: all 10 signal type constructors
-- [x] `UnifiedPipeline`: `ingest_articles()`, `ingest_signal_events()`, `correlate()`, `alert_payloads()`
-- [x] FastAPI: `POST /ingest/articles`, `POST /ingest/signals`, `GET /correlate/{asset}`, `GET /correlate`, `GET /alerts`, `GET /feed-health`, `POST /demo/seed`, `WS /ws/alerts`
-- [x] Redis event bus: `publish_event`, `subscribe_alerts`, heartbeat, feed health
-- [x] `FinnhubNewsPoller`, `CoinGlassFundingPoller`, `PolygonOptionsPoller`
-- [x] `AlertRouter`: Slack + Telegram handlers
-- [x] `WebSocketAlertPanel.tsx`: live alert stream UI component
-- [x] PostgreSQL schema: 9 tables, full indexes, TimescaleDB + pgvector ready
+### Phase 1 — Core Signal Loop (MMP v1.0) — **not started**
+- [ ] Canonical `Event` schema (asset, asset_class, event_type, direction, confidence, timestamp, source, meta)
+- [ ] NLP Pipeline: ticker extraction, sentiment, topic, urgency, dedup
+- [ ] `CorrelationScorer`: weighted, time-decayed, directional confluence formula
+- [ ] `SignalFactory`: all 10 signal type constructors
+- [ ] `UnifiedPipeline`: `ingest_articles()`, `ingest_signal_events()`, `correlate()`, `alert_payloads()`
+- [ ] FastAPI: `POST /ingest/articles`, `POST /ingest/signals`, `GET /correlate/{asset}`, `GET /correlate`, `GET /alerts`, `GET /feed-health`, `POST /demo/seed`, `WS /ws/alerts`
+- [ ] Redis event bus: `publish_event`, `subscribe_alerts`, heartbeat, feed health
+- [ ] `FinnhubNewsPoller`, `CoinGlassFundingPoller`, `PolygonOptionsPoller`
+- [ ] `AlertRouter`: Slack + Telegram handlers
+- [ ] `WebSocketAlertPanel.tsx`: live alert stream UI component
+- [ ] PostgreSQL schema: 9 tables, full indexes, TimescaleDB + pgvector ready
 
-**Remaining for Phase 1 (see § 7 TODOs):** wire real API keys, stand up Postgres/TimescaleDB/pgvector + Redis, set env vars, run migrations, replace in-memory pipeline with DB-backed store, mount the WebSocket panel in the dashboard, full E2E integration test, implement `freshness_guard.py`.
+**Status:** The repository is empty — nothing in Phase 1 (or any later phase) has
+been implemented yet. The items above and the TODOs in § 7 are the build
+order for getting MMP v1.0 to a working state from scratch: scaffold the
+canonical `Event` schema and pipeline classes, stand up Postgres/TimescaleDB/pgvector
++ Redis, wire real API keys, run migrations, build the FastAPI service and
+Redis event bus, build the pollers and alert router, build the WebSocket panel
+and mount it in the dashboard, then run a full E2E integration test and
+implement `freshness_guard.py`.
 
 ### Phase 2 — TA Engine + Dataset Factory (v1.1)
 - [ ] `ta_engine.py`: RSI, MACD, Ichimoku, SMA, EMA, MFI, OBV, VWAP, Momentum
@@ -323,7 +330,7 @@ TA-Native Signal Alerts, ML Forecast-Driven.
 
 ---
 
-## 5. Code Reference (Planned/Existing File Layout)
+## 5. Code Reference (Planned File Layout — none of this exists yet)
 
 ### Core Pipeline (Python)
 - **`unified_pipeline.py`** — Classes: `Event`, `Article`, `NLPResult`, `NLPPipeline`, `SignalFactory`, `CorrelationScorer`, `UnifiedPipeline`. Methods: `ingest_articles()`, `ingest_signal_events()`, `correlate(asset)`, `correlate_all()`, `alert_payloads(threshold, min_signals)`. `NLPPipeline` dedupes and emits `Event`s from `Article`s; `SignalFactory` constructs typed non-news Events; `CorrelationScorer` applies the weighted time-decayed confluence formula; `UnifiedPipeline` merges both streams and orchestrates scoring.
@@ -597,18 +604,22 @@ political_trade  1.1    news            1.0
 
 ## 10. File Manifest
 
-**Built (output/ — promote into proper module paths when wiring up the repo):**
+**Nothing has been built yet.** The repository is empty (no source files,
+no commits beyond this CLAUDE.md). Everything below is planned, per the
+roadmap in § 3 and the TODOs in § 7.
+
+**Phase 1 (build first):**
 ```
-output/unified_pipeline.py          Full pipeline: NLP + signals + scorer
-output/nlp_pipeline.py              Standalone NLP module
-output/correlation_scorer.py        Standalone confluence scorer
-output/api_service.py               FastAPI REST + WebSocket service
-output/event_bus.py                 Redis pub/sub + pollers + alert router
-output/schema.sql                   PostgreSQL / TimescaleDB / pgvector schema
-output/WebSocketAlertPanel.tsx      Next.js WebSocket alert panel component
+unified_pipeline.py          Full pipeline: NLP + signals + scorer
+nlp_pipeline.py              Standalone NLP module
+correlation_scorer.py        Standalone confluence scorer
+api_service.py               FastAPI REST + WebSocket service
+event_bus.py                 Redis pub/sub + pollers + alert router
+schema.sql                   PostgreSQL / TimescaleDB / pgvector schema
+components/WebSocketAlertPanel.tsx   Next.js WebSocket alert panel component
 ```
 
-**Planned (to be generated, per the roadmap in § 3 and § 7):**
+**Phase 2+ (later phases):**
 ```
 src/ta_engine.py
 src/dataset_factory.py
@@ -631,10 +642,12 @@ src-tauri/                          (Tauri 2 desktop shell)
 
 ## 11. Working Conventions for Claude Code in This Repo
 
-- This repository is currently empty (no commits). When implementing Phase 1
-  TODOs, establish the directory layout implied by § 10 (e.g. `src/`,
-  `frontend/`, `components/`, root-level `api_service.py`, `event_bus.py`,
-  `schema.sql`) rather than inventing a different structure.
+- This repository contains no application code yet — only this CLAUDE.md.
+  Phase 1 has not been started; nothing described in § 3/§ 5/§ 10 has been
+  built. When implementing Phase 1 TODOs, establish the directory layout
+  implied by § 10 (e.g. `src/`, `frontend/`, `components/`, root-level
+  `api_service.py`, `event_bus.py`, `schema.sql`) rather than inventing a
+  different structure.
 - Treat § 4 (Key Decisions) and § 8 (Resolved Open Questions) as binding
   defaults — implement against them rather than re-litigating the same
   trade-offs, unless the user asks to revisit one.
