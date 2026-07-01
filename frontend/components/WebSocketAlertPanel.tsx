@@ -15,13 +15,16 @@
  *     unified_pipeline.py never actually emits "low" today, but the badge
  *     still renders a sane color if it ever does)
  *   - confluence score, signal count, top-4 contributing signals per alert
- *   - dedup incoming alerts (same asset + same confluence_score + same
- *     signal_count + same top_contributors in a row are treated as a
- *     repeat, not a new alert -- see dedup key note below)
+ *   - dedup incoming alerts against the ENTIRE rolling buffer (same asset +
+ *     same confluence_score + same signal_count + same top_contributors
+ *     are treated as a repeat regardless of what else interleaved in
+ *     between -- see dedup key note below)
  *   - 50-alert rolling buffer, oldest dropped first
+ *   - resync via `GET /alerts` on mount and on every reconnect, so alerts
+ *     fired while disconnected aren't silently lost from the buffer
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useReconnectingWebSocket, WsStatus } from "../lib/ws";
 
 export interface AlertContributor {
@@ -94,14 +97,46 @@ export function buildAlertsWsUrl(apiHost: string | undefined): { url: string; us
   return { url: `${scheme}://${rest}/ws/alerts`, usedDefault };
 }
 
+/** Same host-resolution logic as `buildAlertsWsUrl`, but for the HTTP(S)
+ * `GET /alerts` endpoint -- used to seed/reconcile the buffer on mount and
+ * on every reconnect, since the WS stream alone can silently miss alerts
+ * fired while the socket was down (see the resync effect below). */
+export function buildAlertsHttpUrl(apiHost: string | undefined): { url: string; usedDefault: boolean } {
+  const usedDefault = !apiHost;
+  const host = apiHost || "localhost:8000";
+
+  let scheme = "http";
+  let rest = host;
+
+  if (/^https:\/\//i.test(host)) {
+    scheme = "https";
+    rest = host.replace(/^https:\/\//i, "");
+  } else if (/^http:\/\//i.test(host)) {
+    scheme = "http";
+    rest = host.replace(/^http:\/\//i, "");
+  } else if (/^wss:\/\//i.test(host)) {
+    scheme = "https";
+    rest = host.replace(/^wss:\/\//i, "");
+  } else if (/^ws:\/\//i.test(host)) {
+    scheme = "http";
+    rest = host.replace(/^ws:\/\//i, "");
+  }
+
+  rest = rest.replace(/\/+$/, "");
+
+  return { url: `${scheme}://${rest}/alerts`, usedDefault };
+}
+
 /** Dedup key for an incoming payload. The backend assigns no alert id, so
  * we build a reasonable composite key from fields that identify "the same
  * alert" for a given asset at a given moment: asset + severity +
  * confluence_score + signal_count + the ordered list of contributing
- * event_type/source pairs. Two consecutive broadcasts for the same asset
- * with identical scoring inputs are treated as a repeat (e.g. a re-publish
- * of an unchanged score) and only the latest occurrence's timestamp is
- * refreshed, rather than growing the buffer with visual duplicates. */
+ * event_type/source pairs. Any buffer entry with the same key (searched
+ * across the ENTIRE rolling buffer, not just the most recent entry --
+ * an interleaved alert for a different asset must not defeat dedup) is
+ * treated as a repeat of the same alert and only its timestamp is
+ * refreshed (and it's bumped to the front), rather than growing the
+ * buffer with a visual duplicate. */
 function dedupKey(payload: AlertPayload): string {
   const contributorsKey = payload.top_contributors
     .map((c) => `${c.event_type}:${c.source}:${c.direction}`)
@@ -183,6 +218,35 @@ function nextLocalId(): string {
   return `alert-${Date.now()}-${localIdCounter}`;
 }
 
+/** Validates and normalizes an unknown payload (from either the WS stream
+ * or a `GET /alerts` response entry) into an `AlertPayload`, or returns
+ * `null` if it doesn't match the expected shape. Shared by both ingestion
+ * paths so they can never drift from each other. */
+function normalizeAlertPayload(data: unknown): AlertPayload | null {
+  if (!data || typeof data !== "object") return null;
+  const payload = data as Partial<AlertPayload>;
+
+  if (
+    typeof payload.asset !== "string" ||
+    typeof payload.confluence_score !== "number" ||
+    typeof payload.signal_count !== "number" ||
+    typeof payload.severity !== "string" ||
+    !Array.isArray(payload.top_contributors)
+  ) {
+    return null;
+  }
+
+  return {
+    asset: payload.asset,
+    confluence_score: payload.confluence_score,
+    signal_count: payload.signal_count,
+    severity: payload.severity,
+    agreement_ratio: typeof payload.agreement_ratio === "number" ? payload.agreement_ratio : 0,
+    conflict_ratio: typeof payload.conflict_ratio === "number" ? payload.conflict_ratio : 0,
+    top_contributors: payload.top_contributors.slice(0, 4) as AlertContributor[],
+  };
+}
+
 export default function WebSocketAlertPanel() {
   const [alerts, setAlerts] = useState<DisplayAlert[]>([]);
 
@@ -190,46 +254,28 @@ export default function WebSocketAlertPanel() {
     () => buildAlertsWsUrl(process.env.NEXT_PUBLIC_API_HOST),
     []
   );
+  const { url: httpAlertsUrl } = useMemo(
+    () => buildAlertsHttpUrl(process.env.NEXT_PUBLIC_API_HOST),
+    []
+  );
 
-  const handleMessage = useCallback((data: unknown) => {
-    if (!data || typeof data !== "object") return;
-    const payload = data as Partial<AlertPayload>;
-
-    if (
-      typeof payload.asset !== "string" ||
-      typeof payload.confluence_score !== "number" ||
-      typeof payload.signal_count !== "number" ||
-      typeof payload.severity !== "string" ||
-      !Array.isArray(payload.top_contributors)
-    ) {
-      // eslint-disable-next-line no-console
-      console.error("WebSocketAlertPanel: received malformed alert payload", data);
-      return;
-    }
-
-    const normalized: AlertPayload = {
-      asset: payload.asset,
-      confluence_score: payload.confluence_score,
-      signal_count: payload.signal_count,
-      severity: payload.severity,
-      agreement_ratio: typeof payload.agreement_ratio === "number" ? payload.agreement_ratio : 0,
-      conflict_ratio: typeof payload.conflict_ratio === "number" ? payload.conflict_ratio : 0,
-      top_contributors: payload.top_contributors.slice(0, 4) as AlertContributor[],
-    };
-
-    const key = dedupKey(normalized);
-
+  /** Merge one normalized payload into the rolling buffer: dedup against
+   * the ENTIRE buffer (not just the most recent entry -- an alert for a
+   * different asset interleaved in between must not defeat dedup for an
+   * unchanged repeat), bump a matched entry to the front with a refreshed
+   * timestamp, otherwise insert as new and trim to MAX_ALERTS. */
+  const mergeAlert = useCallback((payload: AlertPayload) => {
+    const key = dedupKey(payload);
     setAlerts((prev) => {
-      // Dedup: if the most recent alert (regardless of asset) has the same
-      // key, treat this as a repeat broadcast and refresh its timestamp
-      // in place rather than inserting a visual duplicate.
-      if (prev.length > 0 && dedupKey(prev[0]) === key) {
-        const refreshed: DisplayAlert = { ...prev[0], _receivedAt: Date.now() };
-        return [refreshed, ...prev.slice(1)];
+      const existingIdx = prev.findIndex((a) => dedupKey(a) === key);
+      if (existingIdx !== -1) {
+        const refreshed: DisplayAlert = { ...prev[existingIdx], _receivedAt: Date.now() };
+        const withoutExisting = prev.filter((_, i) => i !== existingIdx);
+        return [refreshed, ...withoutExisting];
       }
 
       const withNew: DisplayAlert[] = [
-        { ...normalized, _localId: nextLocalId(), _receivedAt: Date.now() },
+        { ...payload, _localId: nextLocalId(), _receivedAt: Date.now() },
         ...prev,
       ];
 
@@ -241,10 +287,60 @@ export default function WebSocketAlertPanel() {
     });
   }, []);
 
+  const handleMessage = useCallback(
+    (data: unknown) => {
+      const normalized = normalizeAlertPayload(data);
+      if (!normalized) {
+        // eslint-disable-next-line no-console
+        console.error("WebSocketAlertPanel: received malformed alert payload", data);
+        return;
+      }
+      mergeAlert(normalized);
+    },
+    [mergeAlert]
+  );
+
   const { status } = useReconnectingWebSocket({
     url,
     onMessage: handleMessage,
   });
+
+  /** Resync: `GET /alerts` returns every currently-active alert, most
+   * urgent first (api_service.py's `get_alerts` route). The WS stream is
+   * broadcast-only with no server-side per-client backlog beyond a small
+   * bounded queue, so any alert fired while this client was disconnected
+   * (initial mount, or a drop/reconnect) is otherwise gone forever with no
+   * indication anything was missed. Fetching current state here and
+   * merging it through the same dedup path closes that gap: on
+   * (re)connect the panel is reconciled with whatever is still active,
+   * even if the live broadcast announcing it was missed. */
+  const fetchActiveAlerts = useCallback(async () => {
+    try {
+      const res = await fetch(httpAlertsUrl, { cache: "no-store" });
+      if (!res.ok) return;
+      const body = (await res.json()) as { alerts?: unknown[] };
+      if (!Array.isArray(body.alerts)) return;
+      for (const raw of body.alerts) {
+        const normalized = normalizeAlertPayload(raw);
+        if (normalized) mergeAlert(normalized);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("WebSocketAlertPanel: GET /alerts resync failed", err);
+    }
+  }, [httpAlertsUrl, mergeAlert]);
+
+  useEffect(() => {
+    void fetchActiveAlerts();
+  }, [fetchActiveAlerts]);
+
+  const prevStatusRef = useRef<WsStatus>(status);
+  useEffect(() => {
+    if (status === "open" && prevStatusRef.current !== "open") {
+      void fetchActiveAlerts();
+    }
+    prevStatusRef.current = status;
+  }, [status, fetchActiveAlerts]);
 
   const usedDefaultHost = !process.env.NEXT_PUBLIC_API_HOST;
 
