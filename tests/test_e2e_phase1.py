@@ -441,17 +441,27 @@ async def test_slack_and_telegram_notified_within_10s_of_alert():
         "top_contributors": [],
     }
 
+    telegram_url_pattern = re.compile(
+        rf"^https://api\.telegram\.org/bot{re.escape(bot_token)}/sendMessage$"
+    )
+
     with aioresponses() as mocked:
         mocked.post(webhook_url, status=200, payload={"ok": True})
-        mocked.post(
-            re.compile(rf"^https://api\.telegram\.org/bot{re.escape(bot_token)}/sendMessage$"),
-            status=200,
-            payload={"ok": True},
-        )
+        mocked.post(telegram_url_pattern, status=200, payload={"ok": True})
 
         started = time.monotonic()
         await router.dispatch(alert_payload)
         elapsed = time.monotonic() - started
+
+        # AlertRouter.dispatch() catches and logs (not raises) any
+        # individual handler's exception, so a wrong URL/silently-swallowed
+        # failure would NOT surface as a test failure via elapsed time or a
+        # raised exception alone -- assert the mocked endpoints were
+        # actually hit, so a broken handler can't pass this test by doing
+        # nothing.
+        called_urls = [str(url) for _, url in mocked.requests.keys()]
+        assert any(webhook_url == u for u in called_urls), called_urls
+        assert any(telegram_url_pattern.match(u) for u in called_urls), called_urls
 
     assert elapsed < 10.0, f"Slack/Telegram dispatch took {elapsed}s, expected <10s (criterion 4)"
 
