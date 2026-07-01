@@ -640,7 +640,7 @@ src-tauri/                          (Tauri 2 desktop shell)
 
 ---
 
-## 11. Domain Expert & Reviewer Subagents
+## 11. Domain Expert & Reviewer Subagents, and Domain Skills
 
 `.claude/agents/` contains 16 domain-expert/reviewer pairs (32 files total),
 one pair per module named in § 5's Code Reference, spanning all 5 phases.
@@ -648,7 +648,17 @@ Each expert agent owns one module's implementation and cites the exact
 AD/FR/NFR/OQ items that constrain it; each paired reviewer agent checks
 diffs to that module against the same constraints and reports findings
 without editing code. Delegate to these proactively when working in their
-domain rather than re-deriving the same conventions inline:
+domain rather than re-deriving the same conventions inline.
+
+`.claude/skills/<domain>/SKILL.md` mirrors the same 16 domains as an
+in-session knowledge loader: invoke `/event-pipeline`, `/ta-engine`, etc. (or
+let Claude auto-load one by matching its `description`) to pull that
+domain's conventions directly into the current conversation for quick
+reference or direct implementation, without the overhead of spawning a
+subagent. Each skill ends by pointing to its paired `-expert`/`-reviewer`
+agents for heavier implementation or pre-merge review work. Use a skill for
+"quick, in this conversation"; use the matching agent pair for "isolated
+context, or a formal review pass."
 
 | Domain | Module(s) | Phase |
 |---|---|---|
