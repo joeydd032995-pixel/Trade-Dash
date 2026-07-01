@@ -1,0 +1,28 @@
+{
+  "name": "trade-dash-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trade-Dash Phase 1 dashboard frontend (Next.js App Router). Phase 1 scope: WebSocketAlertPanel only (FR-49).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "15.5.19",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "autoprefixer": "10.5.2",
+    "eslint": "8.57.1",
+    "eslint-config-next": "15.5.19",
+    "postcss": "8.5.16",
+    "tailwindcss": "3.4.19",
+    "typescript": "5.9.3"
+  }
+}
