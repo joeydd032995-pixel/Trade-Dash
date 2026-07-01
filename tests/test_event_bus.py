@@ -42,6 +42,7 @@ import event_bus as eb
 from event_bus import (
     ALERT_CACHE_TTL_SECONDS,
     ALERTS_CHANNEL,
+    DEFAULT_POLL_INTERVAL_SECONDS,
     EVENTS_BUFFER_KEY,
     EVENTS_BUFFER_MAX_LEN,
     EVENTS_CHANNEL,
@@ -52,6 +53,7 @@ from event_bus import (
     FeedPoller,
     FinnhubNewsPoller,
     PolygonOptionsPoller,
+    run_all,
     slack_handler,
     telegram_handler,
 )
@@ -371,6 +373,48 @@ async def test_heartbeat_updates_even_when_poll_once_raises(bus: EventBus):
     assert await bus.is_source_fresh("stub_source") is True
 
 
+async def test_permanently_failing_poller_stays_fresh_but_becomes_unhealthy(
+    bus: EventBus, fake_redis: FakeRedis
+):
+    # Regression test for a review finding: heartbeat alone can't
+    # distinguish "alive and legitimately quiet" from "alive but
+    # permanently broken" (e.g. a revoked API key that throws every single
+    # cycle forever), since heartbeat fires unconditionally. A poller that
+    # ALWAYS raises must still report is_stale=False (the loop is running)
+    # but is_healthy=False once its success key has had a chance to expire.
+    poller = _StubPoller(raise_error=True)
+    poller.source_name = "always_broken"
+
+    await poller.run_one_cycle(bus)
+
+    # Heartbeat fired (loop is alive) -- but heartbeat_success never did,
+    # since poll_once() raised every time.
+    assert await bus.is_source_fresh("always_broken") is True
+    assert await bus.is_source_healthy("always_broken") is False
+
+    health = await bus.get_feed_health()
+    assert health["always_broken"]["is_stale"] is False
+    assert health["always_broken"]["is_healthy"] is False
+    assert health["always_broken"]["last_success"] is None
+
+
+async def test_healthy_poller_reports_both_fresh_and_healthy(
+    bus: EventBus, fake_redis: FakeRedis
+):
+    poller = _StubPoller(events_to_return=[])  # legitimately quiet, not broken
+    poller.source_name = "quiet_but_healthy"
+
+    await poller.run_one_cycle(bus)
+
+    assert await bus.is_source_fresh("quiet_but_healthy") is True
+    assert await bus.is_source_healthy("quiet_but_healthy") is True
+
+    health = await bus.get_feed_health()
+    assert health["quiet_but_healthy"]["is_stale"] is False
+    assert health["quiet_but_healthy"]["is_healthy"] is True
+    assert health["quiet_but_healthy"]["last_success"] is not None
+
+
 async def test_single_poller_exception_does_not_crash_others(bus: EventBus):
     bad_poller = _StubPoller(raise_error=True)
     bad_poller.source_name = "bad_source"
@@ -655,6 +699,20 @@ async def test_coinglass_poller_no_extreme_readings_returns_zero_events():
     assert events == []
 
 
+async def test_coinglass_poller_threshold_is_configurable():
+    # Review finding: this threshold gates real signal emission into the
+    # correlation engine, so it must be overridable without a code change.
+    fixture = [{"symbol": "BTC", "exchangeName": "Binance", "rate": 0.002, "openInterest": 5e9}]
+
+    default_poller = _FixtureCoinGlassPoller(fixture)
+    assert await default_poller.poll_once() == []  # below the 0.0075 default
+
+    lenient_poller = _FixtureCoinGlassPoller(fixture, extreme_funding_threshold=0.001)
+    events = await lenient_poller.poll_once()
+    assert len(events) == 1
+    assert events[0].asset == "BTC"
+
+
 class _FixturePolygonPoller(PolygonOptionsPoller):
     def __init__(self, fixture: list[dict], **kwargs):
         super().__init__(api_key="fake-key", **kwargs)
@@ -730,6 +788,28 @@ async def test_polygon_poller_no_flow_above_threshold_returns_zero_events():
     assert events == []
 
 
+async def test_polygon_poller_threshold_is_configurable():
+    # Same review finding as CoinGlassFundingPoller's threshold.
+    fixture = [
+        {
+            "underlying": "AAPL",
+            "contract_type": "call",
+            "strike": 200.0,
+            "expiry": "2026-08-21",
+            "premium": 50_000.0,
+            "side": "buy",
+        }
+    ]
+
+    default_poller = _FixturePolygonPoller(fixture)
+    assert await default_poller.poll_once() == []  # below the $100k default
+
+    lenient_poller = _FixturePolygonPoller(fixture, min_premium_usd=10_000.0)
+    events = await lenient_poller.poll_once()
+    assert len(events) == 1
+    assert events[0].asset == "AAPL"
+
+
 # ---------------------------------------------------------------------------
 # Poller HTTP fetch mocked end-to-end via aioresponses (exercises the real
 # aiohttp _fetch_raw code path, not just the fixture override).
@@ -783,3 +863,87 @@ async def test_finnhub_poller_fetch_raw_via_mocked_http():
         raw = await poller._fetch_raw()
 
     assert raw[0]["headline"] == "Test headline"
+
+
+# ---------------------------------------------------------------------------
+# run_all() — the production entry point (review finding: this previously
+# didn't exist at all, despite being referenced by three separate docstrings
+# and by CLAUDE.md §6 Quick Start's `python event_bus.py`)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_all_wires_pollers_and_router_together(monkeypatch):
+    # Full run() loops are infinite by design (real deployments run them
+    # under process supervision, not pytest) -- this test proves run_all()
+    # actually constructs and starts all 4 concurrent tasks (3 pollers +
+    # AlertRouter) via the real build_event_bus_from_env()/FeedPoller.run()/
+    # AlertRouter.run() call chain, then cancels them, rather than asserting
+    # on an internal implementation detail.
+    fake_redis_instance = FakeRedis()
+    monkeypatch.setattr(eb, "build_event_bus_from_env", lambda: EventBus(fake_redis_instance))
+
+    call_log: list[str] = []
+
+    async def _fake_poller_run(self, event_bus, interval_seconds):
+        call_log.append(f"{type(self).__name__}.run(interval={interval_seconds})")
+        await asyncio.sleep(3600)  # block until cancelled, like the real infinite loop
+
+    async def _fake_router_run(self):
+        call_log.append("AlertRouter.run()")
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(FeedPoller, "run", _fake_poller_run)
+    monkeypatch.setattr(AlertRouter, "run", _fake_router_run)
+
+    task = asyncio.ensure_future(run_all())
+    await asyncio.sleep(0.05)  # let all 4 tasks start and log their call
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert any("FinnhubNewsPoller.run" in c for c in call_log)
+    assert any("CoinGlassFundingPoller.run" in c for c in call_log)
+    assert any("PolygonOptionsPoller.run" in c for c in call_log)
+    assert "AlertRouter.run()" in call_log
+    # Confirms the previously-unenforced "60s default" docstring claim is
+    # now an actual, applied value.
+    assert all(f"interval={DEFAULT_POLL_INTERVAL_SECONDS}" in c for c in call_log if "interval=" in c)
+
+
+async def test_run_all_one_poller_failing_does_not_prevent_others(monkeypatch):
+    # A poller whose run() loop itself raises (not a poll_once() failure --
+    # those are already caught inside run_one_cycle; this simulates a
+    # failure in the loop machinery itself) must not take down the other
+    # tasks via asyncio.gather's default fail-fast behavior.
+    fake_redis_instance = FakeRedis()
+    monkeypatch.setattr(eb, "build_event_bus_from_env", lambda: EventBus(fake_redis_instance))
+
+    call_log: list[str] = []
+
+    async def _failing_poller_run(self, event_bus, interval_seconds):
+        raise RuntimeError("simulated Redis connection drop")
+
+    async def _healthy_poller_run(self, event_bus, interval_seconds):
+        call_log.append(type(self).__name__)
+        await asyncio.sleep(3600)
+
+    async def _fake_router_run(self):
+        call_log.append("AlertRouter")
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(FinnhubNewsPoller, "run", _failing_poller_run)
+    monkeypatch.setattr(CoinGlassFundingPoller, "run", _healthy_poller_run)
+    monkeypatch.setattr(PolygonOptionsPoller, "run", _healthy_poller_run)
+    monkeypatch.setattr(AlertRouter, "run", _fake_router_run)
+
+    task = asyncio.ensure_future(run_all())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The other three tasks kept running despite FinnhubNewsPoller's run()
+    # raising -- proven by them having reached their "started" log line.
+    assert "CoinGlassFundingPoller" in call_log
+    assert "PolygonOptionsPoller" in call_log
+    assert "AlertRouter" in call_log

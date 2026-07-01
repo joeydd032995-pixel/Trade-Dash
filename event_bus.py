@@ -81,9 +81,26 @@ FEED_HEALTH_TTL_SECONDS = 5 * 60
 #: Key prefix for per-source feed-health heartbeats.
 FEED_HEALTH_KEY_PREFIX = "feed_health:"
 
+#: Key prefix for per-source "last successful poll" markers. Distinct from
+#: `FEED_HEALTH_KEY_PREFIX`: heartbeat fires every cycle unconditionally
+#: (including on a caught exception, per FeedPoller.run_one_cycle's
+#: docstring), so heartbeat alone can't distinguish "alive and legitimately
+#: quiet" from "alive but permanently broken" (e.g. a revoked API key that
+#: throws every single cycle forever). This key is only refreshed from the
+#: NON-exception branch, so if a poller has been failing continuously for
+#: longer than FEED_HEALTH_TTL_SECONDS, this key expires while the
+#: heartbeat key keeps renewing -- `get_feed_health()` surfaces both so a
+#: caller (freshness_guard.py, a future dashboard panel) can tell them
+#: apart. Review finding fixed here.
+FEED_SUCCESS_KEY_PREFIX = "feed_success:"
+
 
 def _feed_health_key(source: str) -> str:
     return f"{FEED_HEALTH_KEY_PREFIX}{source}"
+
+
+def _feed_success_key(source: str) -> str:
+    return f"{FEED_SUCCESS_KEY_PREFIX}{source}"
 
 
 def _alert_cache_key(asset: str) -> str:
@@ -209,37 +226,90 @@ class EventBus:
         now_iso = datetime.now(timezone.utc).isoformat()
         await self._redis.setex(_feed_health_key(source), FEED_HEALTH_TTL_SECONDS, now_iso)
 
-    async def get_feed_health(self) -> dict[str, dict]:
-        """Return `{source: {"last_seen": <iso str or None>, "is_stale": bool}}`
-        for every feed-health key currently present.
+    async def heartbeat_success(self, source: str) -> None:
+        """Mark `source`'s most recent poll cycle as a genuine success (no
+        exception raised) -- distinct from `heartbeat()`, which fires every
+        cycle unconditionally (see `FEED_SUCCESS_KEY_PREFIX` docstring for
+        why this distinction exists). Same TTL as `heartbeat()`: if a poller
+        fails continuously for longer than `FEED_HEALTH_TTL_SECONDS`, this
+        key expires even though the heartbeat key keeps renewing.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self._redis.setex(_feed_success_key(source), FEED_HEALTH_TTL_SECONDS, now_iso)
 
-        Staleness is determined purely by Redis TTL auto-expiry (NFR-06): if
-        a key is gone, that source is stale (or has never reported at all).
-        This method only reports on sources that currently have (or very
-        recently had) a key -- callers who need to assert a *specific*
-        expected source list should diff against their own registry (see
+    async def get_feed_health(self) -> dict[str, dict]:
+        """Return per-source feed health, keyed by every source that has a
+        heartbeat and/or success key currently present:
+
+            {source: {"last_seen": <iso str or None>, "is_stale": bool,
+                       "last_success": <iso str or None>, "is_healthy": bool}}
+
+        `is_stale` reflects heartbeat TTL (NFR-06): if the heartbeat key is
+        gone, the poller loop itself isn't running (or never has).
+        `is_healthy` reflects the SUCCESS key specifically: a poller can be
+        `is_stale=False` (still heartbeating every cycle) while
+        `is_healthy=False` (every one of those cycles has been raising for
+        longer than the TTL window) -- e.g. a revoked API key. This is the
+        one signal that distinguishes "alive and legitimately quiet" from
+        "alive but permanently broken," which heartbeat alone cannot (review
+        finding). Callers who need to assert a *specific* expected source
+        list should diff against their own registry (see
         `freshness_guard.py`, which does exactly that).
         """
-        keys = await self._redis.keys(f"{FEED_HEALTH_KEY_PREFIX}*")
+        health_keys = await self._redis.keys(f"{FEED_HEALTH_KEY_PREFIX}*")
+        success_keys = await self._redis.keys(f"{FEED_SUCCESS_KEY_PREFIX}*")
+
         health: dict[str, dict] = {}
-        for key in keys:
+
+        for key in health_keys:
             key_str = key.decode("utf-8") if isinstance(key, (bytes, bytearray)) else key
             source = key_str[len(FEED_HEALTH_KEY_PREFIX):]
             value = await self._redis.get(key)
             if value is None:
                 # Expired between `keys()` and `get()` -- treat as stale.
                 health[source] = {"last_seen": None, "is_stale": True}
-                continue
-            if isinstance(value, (bytes, bytearray)):
-                value = value.decode("utf-8")
-            health[source] = {"last_seen": value, "is_stale": False}
+            else:
+                if isinstance(value, (bytes, bytearray)):
+                    value = value.decode("utf-8")
+                health[source] = {"last_seen": value, "is_stale": False}
+
+        for key in success_keys:
+            key_str = key.decode("utf-8") if isinstance(key, (bytes, bytearray)) else key
+            source = key_str[len(FEED_SUCCESS_KEY_PREFIX):]
+            value = await self._redis.get(key)
+            entry = health.setdefault(
+                source, {"last_seen": None, "is_stale": True}
+            )
+            if value is None:
+                entry["last_success"] = None
+                entry["is_healthy"] = False
+            else:
+                if isinstance(value, (bytes, bytearray)):
+                    value = value.decode("utf-8")
+                entry["last_success"] = value
+                entry["is_healthy"] = True
+
+        # A source with a heartbeat but no success key at all (never
+        # succeeded, or its success key already expired) is unhealthy.
+        for source, entry in health.items():
+            entry.setdefault("last_success", None)
+            entry.setdefault("is_healthy", False)
+
         return health
 
     async def is_source_fresh(self, source: str) -> bool:
         """Convenience check for a single source: True iff its feed-health
-        key currently exists (has not expired).
+        key currently exists (has not expired). Reflects heartbeat only --
+        see `get_feed_health()`'s `is_healthy` for the success-based signal.
         """
         return bool(await self._redis.exists(_feed_health_key(source)))
+
+    async def is_source_healthy(self, source: str) -> bool:
+        """Convenience check: True iff `source`'s most recent successful
+        (non-exception) poll cycle was within `FEED_HEALTH_TTL_SECONDS`.
+        Distinct from `is_source_fresh()` -- see `heartbeat_success()`.
+        """
+        return bool(await self._redis.exists(_feed_success_key(source)))
 
 
 def build_event_bus_from_env() -> EventBus:
@@ -320,6 +390,7 @@ class FeedPoller(ABC):
         it also exists standalone so tests can exercise "one cycle" directly
         without fighting `run()`'s infinite loop / real `asyncio.sleep`.
         """
+        succeeded = True
         try:
             events = await self.poll_once()
         except Exception:
@@ -329,12 +400,18 @@ class FeedPoller(ABC):
                 type(self).__name__,
             )
             events = []
+            succeeded = False
 
         for event in events:
             await event_bus.publish_event(event)
 
-        # Unconditional -- see docstring above.
+        # Unconditional -- see docstring above. This is deliberately
+        # separate from heartbeat_success below: heartbeat proves the loop
+        # is alive, heartbeat_success proves it's actually working (see
+        # FEED_SUCCESS_KEY_PREFIX docstring -- review finding fixed here).
         await event_bus.heartbeat(self.source_name)
+        if succeeded:
+            await event_bus.heartbeat_success(self.source_name)
         return events
 
     async def run(self, event_bus: EventBus, interval_seconds: float) -> None:
@@ -488,16 +565,26 @@ class CoinGlassFundingPoller(FeedPoller):
 
     API_URL = "https://open-api.coinglass.com/public/v2/funding"
 
-    #: See class docstring for rationale.
+    #: Default; see class docstring for rationale. Overridable per-instance
+    #: via the `extreme_funding_threshold` constructor parameter (review
+    #: finding: this gates what enters the correlation engine at all, so a
+    #: value that turns out wrong in production should be a config change,
+    #: not a code change + redeploy).
     EXTREME_FUNDING_THRESHOLD = 0.0075
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         session: Optional[Any] = None,
+        extreme_funding_threshold: Optional[float] = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.environ.get("COINGLASS_API_KEY")
         self._session = session
+        self.extreme_funding_threshold = (
+            extreme_funding_threshold
+            if extreme_funding_threshold is not None
+            else self.EXTREME_FUNDING_THRESHOLD
+        )
 
     async def _fetch_raw(self) -> list[dict]:
         """Fetch raw funding-rate reading dicts from CoinGlass. Real network
@@ -534,7 +621,7 @@ class CoinGlassFundingPoller(FeedPoller):
             rate = item.get("rate")
             if symbol is None or rate is None:
                 continue
-            if abs(rate) <= self.EXTREME_FUNDING_THRESHOLD:
+            if abs(rate) <= self.extreme_funding_threshold:
                 continue
 
             direction = 1 if rate < 0 else -1
@@ -545,7 +632,7 @@ class CoinGlassFundingPoller(FeedPoller):
             # a contrarian bullish signal. This mirrors how funding_extreme
             # is documented as a leading/contrarian indicator elsewhere in
             # CLAUDE.md's signal weight rationale (AD-05).
-            confidence = min(1.0, abs(rate) / (self.EXTREME_FUNDING_THRESHOLD * 4))
+            confidence = min(1.0, abs(rate) / (self.extreme_funding_threshold * 4))
 
             events.append(
                 SignalFactory.funding_extreme(
@@ -590,20 +677,28 @@ class PolygonOptionsPoller(FeedPoller):
 
     API_URL = "https://api.polygon.io/v3/snapshot/options"
 
-    #: Minimum total premium (USD) for a trade to be treated as "unusual"
-    #: options flow worth emitting as an Event. Documented, not derived from
-    #: a live percentile (same rationale as CoinGlassFundingPoller's fixed
-    #: threshold) -- $100k is a common informal "sweep" threshold used by
-    #: retail options-flow tools as a floor for "worth paying attention to".
+    #: Default minimum total premium (USD) for a trade to be treated as
+    #: "unusual" options flow worth emitting as an Event. Documented, not
+    #: derived from a live percentile (same rationale as
+    #: CoinGlassFundingPoller's fixed threshold) -- $100k is a common
+    #: informal "sweep" threshold used by retail options-flow tools as a
+    #: floor for "worth paying attention to". Overridable per-instance via
+    #: the `min_premium_usd` constructor parameter (same review finding as
+    #: CoinGlassFundingPoller's threshold -- this gates real signal
+    #: emission, so it should be a config change, not a redeploy).
     MIN_PREMIUM_USD = 100_000.0
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         session: Optional[Any] = None,
+        min_premium_usd: Optional[float] = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.environ.get("POLYGON_API_KEY")
         self._session = session
+        self.min_premium_usd = (
+            min_premium_usd if min_premium_usd is not None else self.MIN_PREMIUM_USD
+        )
 
     async def _fetch_raw(self) -> list[dict]:
         """Fetch raw options-flow dicts from Polygon. Real network call --
@@ -640,7 +735,7 @@ class PolygonOptionsPoller(FeedPoller):
             premium = item.get("premium")
             if underlying is None or premium is None:
                 continue
-            if premium < self.MIN_PREMIUM_USD:
+            if premium < self.min_premium_usd:
                 continue
 
             contract_type = item.get("contract_type", "call")
@@ -648,7 +743,7 @@ class PolygonOptionsPoller(FeedPoller):
             # call+buy or put+sell => bullish; put+buy or call+sell => bearish.
             bullish = (contract_type == "call") == (side == "buy")
             direction = 1 if bullish else -1
-            confidence = min(1.0, premium / (self.MIN_PREMIUM_USD * 10))
+            confidence = min(1.0, premium / (self.min_premium_usd * 10))
 
             events.append(
                 SignalFactory.options_flow(
@@ -821,6 +916,79 @@ async def telegram_handler(alert_payload: dict, bot_token: str, chat_id: str) ->
             resp.raise_for_status()
 
 
+#: Default poll interval (seconds) for all three Phase 1 pollers. Finnhub's
+#: 60/min free-tier limit and CoinGlass's per-minute throttling both leave
+#: comfortable headroom at this cadence. Polygon's free/Starter tier (5
+#: calls/min = 1 call per 12s at full utilization) has a much tighter
+#: margin -- 60s is still safely within it for a single poller instance,
+#: but if this process ever runs multiple Polygon-polling instances sharing
+#: one API key, this constant is the first thing to widen (review finding:
+#: this note previously existed only in a docstring with no code path that
+#: actually applied it -- see `run_all()` below, which is that code path).
+DEFAULT_POLL_INTERVAL_SECONDS = 60.0
+
+
+async def run_all() -> None:
+    """Production entry point (CLAUDE.md §6 Quick Start: `python event_bus.py`).
+
+    Wires together `build_event_bus_from_env()`, the three Phase 1 pollers
+    (constructed from env-var API keys, per NFR-05), and `AlertRouter`
+    (registered with Slack/Telegram from env vars via
+    `register_default_handlers()`), then runs all of them concurrently via
+    `asyncio.gather()` until cancelled (e.g. SIGINT/SIGTERM in a real
+    deployment, or a test harness cancelling the task).
+
+    Review finding fixed here: prior to this, `run_all` was referenced by
+    three separate docstrings (this module's own header, `FeedPoller.run`,
+    `build_event_bus_from_env`) as "the" production entry point, but did
+    not exist -- `python event_bus.py` did nothing at all. Each poller's
+    `run()` loop is independently wrapped in `_run_poller_forever` so one
+    poller's task failing (which shouldn't happen -- `FeedPoller.run_one_cycle`
+    already catches `poll_once()` exceptions -- but belt-and-suspenders
+    against something raising out of the loop machinery itself, e.g. a
+    Redis connection drop) is logged rather than taking down the other
+    tasks via `asyncio.gather`'s default fail-fast behavior.
+    """
+    event_bus = build_event_bus_from_env()
+
+    pollers: list[FeedPoller] = [
+        FinnhubNewsPoller(),
+        CoinGlassFundingPoller(),
+        PolygonOptionsPoller(),
+    ]
+
+    router = AlertRouter(event_bus)
+    router.register_default_handlers()
+
+    async def _run_poller_forever(poller: FeedPoller) -> None:
+        try:
+            await poller.run(event_bus, DEFAULT_POLL_INTERVAL_SECONDS)
+        except Exception:
+            logger.exception(
+                "%s's run() loop exited unexpectedly (not a poll_once() "
+                "failure -- those are already caught inside run_one_cycle; "
+                "this is a failure in the loop machinery itself, e.g. a "
+                "Redis connection drop)",
+                type(poller).__name__,
+            )
+
+    async def _run_router_forever() -> None:
+        try:
+            await router.run()
+        except Exception:
+            logger.exception("AlertRouter.run() exited unexpectedly")
+
+    tasks = [_run_poller_forever(poller) for poller in pollers]
+    tasks.append(_run_router_forever())
+
+    await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(run_all())
+
+
 __all__ = [
     "EventBus",
     "build_event_bus_from_env",
@@ -831,6 +999,8 @@ __all__ = [
     "AlertRouter",
     "slack_handler",
     "telegram_handler",
+    "run_all",
+    "DEFAULT_POLL_INTERVAL_SECONDS",
     "EVENTS_CHANNEL",
     "ALERTS_CHANNEL",
     "EVENTS_BUFFER_KEY",
@@ -838,4 +1008,5 @@ __all__ = [
     "ALERT_CACHE_TTL_SECONDS",
     "FEED_HEALTH_TTL_SECONDS",
     "FEED_HEALTH_KEY_PREFIX",
+    "FEED_SUCCESS_KEY_PREFIX",
 ]
