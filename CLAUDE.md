@@ -683,6 +683,16 @@ The `connector-layer` pair is the highest-stakes review surface in the repo
 (it gates real capital) — its reviewer is instructed to apply maximum
 scrutiny and re-verify before declaring a diff clean.
 
+Two additional skills cover cross-cutting Phase 1 concerns that span
+multiple modules rather than owning one, and so have no dedicated agent
+pair — route actual defects found while using them to whichever module's
+agent pair owns the broken piece:
+
+| Skill | Spans | Phase |
+|---|---|---|
+| `e2e-integration-tests` | article/signal ingest → NLP → CorrelationScorer → WebSocket → Slack/Telegram → Postgres; MMP acceptance criteria | 1 |
+| `infrastructure-ops` | docker-compose (Postgres/TimescaleDB/pgvector/Redis), env-var/secrets wiring, migrations, local-vs-Kubernetes parity | 1 |
+
 ## 12. Working Conventions for Claude Code in This Repo
 
 - This repository contains no application code yet — only this CLAUDE.md.
