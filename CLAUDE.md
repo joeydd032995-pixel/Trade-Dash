@@ -640,7 +640,40 @@ src-tauri/                          (Tauri 2 desktop shell)
 
 ---
 
-## 11. Working Conventions for Claude Code in This Repo
+## 11. Domain Expert & Reviewer Subagents
+
+`.claude/agents/` contains 16 domain-expert/reviewer pairs (32 files total),
+one pair per module named in § 5's Code Reference, spanning all 5 phases.
+Each expert agent owns one module's implementation and cites the exact
+AD/FR/NFR/OQ items that constrain it; each paired reviewer agent checks
+diffs to that module against the same constraints and reports findings
+without editing code. Delegate to these proactively when working in their
+domain rather than re-deriving the same conventions inline:
+
+| Domain | Module(s) | Phase |
+|---|---|---|
+| `event-pipeline` | `unified_pipeline.py` (Event, SignalFactory, UnifiedPipeline) | 1 |
+| `nlp-pipeline` | `nlp_pipeline.py` (sentiment/NER/dedup, lexicon→prod swap) | 1/2 |
+| `correlation-scorer` | `correlation_scorer.py` (confluence formula, dark signal queue) | 1 |
+| `api-service` | `api_service.py` (FastAPI REST + WebSocket) | 1 |
+| `event-bus` | `event_bus.py` (Redis pub/sub, pollers, AlertRouter) | 1/2 |
+| `database-schema` | `schema.sql` (Postgres/TimescaleDB/pgvector) | 1 |
+| `ta-engine` | `ta_engine.py` (RSI/MACD/Ichimoku/etc., batch+streaming) | 2 |
+| `backtesting-harness` | vectorbt walk-forward validator, deployment gate | 2 |
+| `dataset-factory` | `dataset_factory.py` (Celery/Redis/S3/Minio) | 2 |
+| `ml-forecast-lab` | `forecast_lab.py` (LSTM/RNN/ARIMA/sklearn) | 3 |
+| `agent-orchestrator` | `agent_orchestrator.py` (swarm, memory, MCP) | 3 |
+| `shadow-account` | `shadow_account.py` (broker import, rule extraction) | 3 |
+| `strategy-exporters` | `exporters/pine_exporter.py`, `exporters/mql5_exporter.py` | 4 |
+| `intelligence-briefing` | `intelligence_brief_service.py`, `freshness_guard.py` | 4 |
+| `connector-layer` | `connector_profiles.py` (paper/live, mandates, halt) | 5 |
+| `frontend-dashboard` | Next.js/React panels (`*.tsx`), Tauri 2 shell | 1-4 |
+
+The `connector-layer` pair is the highest-stakes review surface in the repo
+(it gates real capital) — its reviewer is instructed to apply maximum
+scrutiny and re-verify before declaring a diff clean.
+
+## 12. Working Conventions for Claude Code in This Repo
 
 - This repository contains no application code yet — only this CLAUDE.md.
   Phase 1 has not been started; nothing described in § 3/§ 5/§ 10 has been
