@@ -97,6 +97,36 @@ def test_extract_tickers_cashtag_prefix_is_stripped():
     tickers = extract_tickers(text)
     assert "NVDA" in tickers
     assert "BTC" in tickers
+
+
+def test_extract_tickers_all_caps_shouted_headline_excludes_ambiguous_common_words():
+    # Regression: an ALL-CAPS "shouted" headline (a real financial wire/
+    # flash-headline style) previously defeated the allowlist guard for
+    # common-English-word tickers, since casing alone can't distinguish
+    # "shouting a real ticker" from "shouting an ordinary word" once every
+    # word is capitalized. ARE/NOW/FOR/SO/ALL are all in
+    # DEFAULT_KNOWN_ASSETS (they're also real tickers) but must not be
+    # extracted here — there's no actual ticker mention in this sentence.
+    text = "FED OFFICIALS ARE NOW READY FOR A RATE HIKE SO ALL MARKETS WATCH CLOSELY"
+    tickers = extract_tickers(text)
+    assert tickers == []
+
+
+def test_extract_tickers_all_caps_headline_still_extracts_genuine_tickers():
+    # The all-caps guard must not become a blanket suppression — a real
+    # ticker mentioned in a shouted headline should still be extracted.
+    text = "NVDA SURGES ON STRONG DEMAND ARE YOU READY"
+    tickers = extract_tickers(text)
+    assert "NVDA" in tickers
+    assert "ARE" not in tickers
+
+
+def test_extract_tickers_all_caps_cashtag_overrides_ambiguous_word_guard():
+    # A '$' cashtag is an unambiguous signal and should override the
+    # all-caps ambiguous-word guard even for a word like "ALL" or "ARE".
+    text = "TRADERS SAY $ALL IS UNDERVALUED RIGHT NOW"
+    tickers = extract_tickers(text, known_assets={"ALL"})
+    assert "ALL" in tickers
     assert "$NVDA" not in tickers
 
 
@@ -127,6 +157,41 @@ def test_score_sentiment_stays_within_bounds():
     text = "surge rally beat upgrade bullish outperform record high " * 5
     score = score_sentiment(text)
     assert -1.0 <= score <= 1.0
+
+
+def test_score_sentiment_does_not_match_bullish_word_as_substring():
+    # Regression: "gain" must not match inside "bargain" — str.count-based
+    # substring matching previously scored this as fully bullish (+1.0)
+    # with zero actual bullish language present.
+    text = "The company is bargain priced."
+    assert score_sentiment(text) == 0.0
+
+
+def test_score_sentiment_does_not_match_bearish_word_as_substring():
+    # Regression: "warning" must not match inside "warnings" (a different
+    # word/tense) on unrelated, non-financial text.
+    text = "Weather warnings were issued for the region."
+    assert score_sentiment(text) == 0.0
+
+
+@pytest.mark.parametrize(
+    "text,expected_sign",
+    [
+        ("Shares rallied sharply after the announcement.", 1),
+        ("The stock crashed following the disappointing report.", -1),
+    ],
+)
+def test_score_sentiment_lexicon_words_added_during_implementation(text, expected_sign):
+    # Regression test for a specific lexicon gap found and fixed during
+    # implementation: "rallied" was missing from BULLISH_WORDS, and
+    # "crashed"/"plunged" were missing from BEARISH_WORDS, which (before
+    # the fix) left these exact words unscored. Isolating them here (distinct
+    # from the general bullish/bearish tests above, which use different
+    # words) so a future lexicon refactor can't silently drop them again
+    # with nothing failing.
+    score = score_sentiment(text)
+    assert (score > 0) == (expected_sign > 0)
+    assert score != 0.0
 
 
 def test_score_sentiment_long_mostly_neutral_article_with_one_bullish_word_not_maxed():
@@ -270,6 +335,52 @@ def test_is_duplicate_near_dupe_across_sources_same_ticker():
     dup, dup_of = is_duplicate(near_dupe, [original], tickers, similarity_threshold=0.8)
     assert dup is True
     assert dup_of == fingerprint(original)
+
+
+def test_is_duplicate_respects_custom_known_assets_for_candidate_ticker_extraction():
+    # Regression: is_duplicate used to always re-extract each corpus
+    # candidate's tickers with DEFAULT_KNOWN_ASSETS regardless of what
+    # allowlist actually produced the target article's `tickers` argument.
+    # For any ticker outside the hardcoded default set (exactly the
+    # production case per this module's docstring — a live `assets`-table
+    # allowlist), the candidate side always extracted [], so
+    # target_ticker_set.isdisjoint(candidate_tickers) was always True and
+    # tier 2 (near-dupe similarity) silently never fired. "ZORP" is
+    # deliberately NOT in DEFAULT_KNOWN_ASSETS to prove this.
+    custom_assets = {"ZORP"}
+    original = make_article(
+        headline="ZORP shares rise on strong earnings report",
+        body="ZORP posted strong quarterly results beating estimates.",
+        source="finnhub",
+    )
+    near_dupe = make_article(
+        headline="ZORP shares rise on strong earnings report today",
+        body="ZORP posted strong quarterly results beating estimates broadly.",
+        source="benzinga",
+    )
+    tickers = extract_tickers(
+        near_dupe.headline + " " + near_dupe.body, known_assets=custom_assets
+    )
+    assert tickers == ["ZORP"]  # sanity check the fixture actually extracts
+
+    dup, dup_of = is_duplicate(
+        near_dupe,
+        [original],
+        tickers,
+        similarity_threshold=0.5,
+        known_assets=custom_assets,
+    )
+    assert dup is True
+    assert dup_of == fingerprint(original)
+
+    # Without known_assets passed through, the old buggy behavior
+    # re-surfaces: candidate-side extraction falls back to the default
+    # allowlist, "ZORP" isn't in it, so the shared-ticker scope is empty and
+    # tier 2 never runs.
+    dup_without_known_assets, _ = is_duplicate(
+        near_dupe, [original], tickers, similarity_threshold=0.5
+    )
+    assert dup_without_known_assets is False
 
 
 def test_is_duplicate_false_positive_prevention_different_tickers_not_deduped():

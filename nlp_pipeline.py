@@ -85,6 +85,38 @@ DEFAULT_KNOWN_ASSETS: frozenset[str] = frozenset(
 # — the regex only decides what *could* be a symbol.
 _CANDIDATE_RE = re.compile(r"\$?\b[A-Z]{1,5}\b")
 
+# Common English words that also happen to be real ticker symbols in
+# DEFAULT_KNOWN_ASSETS (A=Agilent, ON=ON Semiconductor, IT=Gartner,
+# CAT=Caterpillar, etc.). The mixed-case allowlist check alone correctly
+# handles ordinary text (a title-case sentence like "Fed Officials Are Now
+# Ready" only capitalizes "Are"/"Now" as normal English capitalization,
+# which _CANDIDATE_RE's all-caps requirement already excludes). But
+# ALL-CAPS "shouted" headlines/wire-flash text — a real financial-news
+# style — capitalize every word, so ordinary words like ARE/NOW/FOR/SO/ALL
+# become indistinguishable from a genuine all-caps ticker mention purely by
+# casing (review finding: "FED OFFICIALS ARE NOW READY..." incorrectly
+# extracted ARE/NOW/FOR/SO/ALL). A '$' cashtag prefix is an unambiguous
+# signal and always overrides this guard.
+_AMBIGUOUS_COMMON_WORDS: frozenset[str] = frozenset(
+    {"A", "ON", "IT", "SO", "ALL", "NOW", "GO", "FOR", "ARE", "CAT"}
+)
+
+
+def _looks_all_caps(text: str) -> bool:
+    """True if `text` has no lowercase letters among >=6 alphabetic chars.
+
+    Distinguishes a genuinely all-caps "shouted" headline (zero lowercase
+    anywhere) from ordinary mixed-case text that merely contains one
+    capitalized ticker mention (which will have plenty of lowercase letters
+    elsewhere and correctly NOT trigger this). The 6-letter minimum avoids
+    misclassifying very short strings (e.g. a bare "$NVDA" cashtag with no
+    surrounding prose) as "all caps shouting."
+    """
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 6:
+        return False
+    return all(c.isupper() for c in letters)
+
 
 def extract_tickers(text: str, known_assets: set[str] | None = None) -> list[str]:
     """Extract ticker symbols mentioned in `text`.
@@ -97,6 +129,13 @@ def extract_tickers(text: str, known_assets: set[str] | None = None) -> list[str
     "ALL", "NOW", "GO", "FOR", "ARE", "CAT") are only ever extracted when
     they're *also* real ticker symbols in the allowlist, and only when they
     appear as a standalone token (never as part of a longer word).
+
+    Additionally, if `text` as a whole is ALL-CAPS "shouted" style (no
+    lowercase letters at all — a real financial wire/flash-headline
+    convention), ambiguous common-English-word tickers are excluded unless
+    explicitly cashtag-prefixed ('$'), since casing alone can no longer
+    distinguish "shouting a real ticker" from "shouting an ordinary word"
+    in that mode (see `_looks_all_caps`/`_AMBIGUOUS_COMMON_WORDS`).
 
     Args:
         text: Article text (headline and/or body) to scan.
@@ -114,12 +153,18 @@ def extract_tickers(text: str, known_assets: set[str] | None = None) -> list[str
         return []
 
     allowlist = known_assets if known_assets is not None else DEFAULT_KNOWN_ASSETS
+    shouting = _looks_all_caps(text)
 
     found: list[str] = []
     seen: set[str] = set()
     for match in _CANDIDATE_RE.finditer(text):
         raw = match.group(0)
         symbol = raw.lstrip("$")
+        is_cashtag = raw.startswith("$")
+
+        if shouting and not is_cashtag and symbol in _AMBIGUOUS_COMMON_WORDS:
+            continue  # ambiguous in all-caps-shouting mode without a cashtag
+
         if symbol in allowlist and symbol not in seen:
             seen.add(symbol)
             found.append(symbol)
@@ -167,6 +212,23 @@ BEARISH_WORDS: tuple[str, ...] = (
 )
 
 
+def _compile_word_patterns(words: tuple[str, ...]) -> list[re.Pattern[str]]:
+    """Compile each lexicon entry as a whole-word/phrase regex.
+
+    Using `\\b...\\b` (not `str.count`, a plain substring search) so a word
+    like "gain" doesn't match inside "bargain", or "warning" doesn't match
+    inside "warnings" (a different word/tense entirely). Multi-word phrases
+    (e.g. "record high") still work correctly since the space between words
+    is already a non-word-character boundary; `\\b` only needs to anchor the
+    phrase's outer edges.
+    """
+    return [re.compile(r"\b" + re.escape(word) + r"\b") for word in words]
+
+
+_BULLISH_PATTERNS = _compile_word_patterns(BULLISH_WORDS)
+_BEARISH_PATTERNS = _compile_word_patterns(BEARISH_WORDS)
+
+
 def score_sentiment(text: str) -> float:
     """Score `text`'s sentiment in `[-1.0, 1.0]`.
 
@@ -177,6 +239,22 @@ def score_sentiment(text: str) -> float:
     single incidental bullish word from being forced to +1.0/-1.0; a lone
     match still produces a strong-but-not-maxed score, while a lopsided mix
     of many matches produces a score close to the extremes.
+
+    Matches are whole-word/phrase (`\\b`-bounded), NOT substring — "gain"
+    must not match inside "bargain", "warning" must not match inside
+    "warnings" (review finding: substring `str.count` previously scored
+    "The company is bargain priced." as fully bullish (+1.0) purely from
+    "gain" inside "bargain", with no actual bullish language present).
+
+    Known remaining limitation (accepted, not "fixed" further): a handful
+    of lexicon entries are legitimate standalone English words with an
+    unrelated common meaning outside finance (e.g. "recall" as in a product
+    recall vs. a political recall election) — word-boundary matching can't
+    disambiguate meaning, only substrings-within-words. This is an inherent
+    limit of any word-list lexicon, not a matching bug, and is exactly what
+    the prod swap to finbert (AD-06) exists to fix; removing ambiguous words
+    entirely would just as often lose genuine bearish signal (a real
+    product recall headline) as it prevents a false positive.
 
     Prod swap point (AD-06): replace the function body with a call to
     `ProsusAI/finbert` (via `transformers`) — the signature
@@ -193,8 +271,8 @@ def score_sentiment(text: str) -> float:
 
     normalized = text.lower()
 
-    bull_count = sum(normalized.count(word) for word in BULLISH_WORDS)
-    bear_count = sum(normalized.count(word) for word in BEARISH_WORDS)
+    bull_count = sum(len(pattern.findall(normalized)) for pattern in _BULLISH_PATTERNS)
+    bear_count = sum(len(pattern.findall(normalized)) for pattern in _BEARISH_PATTERNS)
 
     total = bull_count + bear_count
     if total == 0:
@@ -431,6 +509,7 @@ def is_duplicate(
     corpus: list[Article],
     tickers: list[str],
     similarity_threshold: float = 0.92,
+    known_assets: set[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether `article` duplicates an article already in `corpus`.
 
@@ -453,12 +532,23 @@ def is_duplicate(
     somewhere queryable; this dev implementation re-extracts each
     candidate's tickers on the fly for simplicity (see note below).
 
+    `known_assets` MUST be the same allowlist used to derive `tickers` for
+    `article` in the first place. Review finding fixed here: this function
+    used to always re-extract each candidate's tickers with the *default*
+    allowlist regardless of what allowlist produced `tickers`, so any
+    ticker outside `DEFAULT_KNOWN_ASSETS` (e.g. a caller-supplied allowlist,
+    or eventually the live `assets`-table allowlist per the module
+    docstring) made `target_ticker_set.isdisjoint(candidate_tickers)`
+    always true — tier 2 silently never fired for that ticker, a dedup
+    false negative with zero test coverage. Passing the same `known_assets`
+    through to both sides fixes this.
+
     Prod swap point (AD-06): replace the body with a pgvector query scoped
     by a ticker join (`WHERE articles.id IN (SELECT article_id FROM
     article_tickers WHERE ticker = ANY(:tickers))`) ordered by `embedding
     <=> :query_embedding` with the same threshold semantics. Signature
-    (`is_duplicate(article, corpus, tickers, similarity_threshold) ->
-    tuple[bool, str | None]`) stays identical.
+    (`is_duplicate(article, corpus, tickers, similarity_threshold,
+    known_assets) -> tuple[bool, str | None]`) stays identical.
 
     Args:
         article: The new `Article` being checked for duplication.
@@ -468,6 +558,10 @@ def is_duplicate(
             detection across sources. Defaults to 0.92 per CLAUDE.md's
             starting point (tune against false-positive dedup of
             genuinely distinct articles about the same ticker).
+        known_assets: The SAME allowlist used to produce `tickers` (i.e.
+            whatever was passed to `extract_tickers` for `article`). Falls
+            back to `DEFAULT_KNOWN_ASSETS` if omitted, matching
+            `extract_tickers`'s own default.
 
     Returns:
         `(is_duplicate, duplicate_of)` — `duplicate_of` is the matched
@@ -499,7 +593,11 @@ def is_duplicate(
         return False, None
 
     for candidate in corpus:
-        candidate_tickers = set(extract_tickers(candidate.headline + " " + candidate.body))
+        candidate_tickers = set(
+            extract_tickers(
+                candidate.headline + " " + candidate.body, known_assets=known_assets
+            )
+        )
         if target_ticker_set.isdisjoint(candidate_tickers):
             continue  # no shared ticker — never dedup across unrelated tickers
 
@@ -568,7 +666,11 @@ class NLPPipeline:
         self, article: Article, corpus: list[Article], tickers: list[str]
     ) -> tuple[bool, str | None]:
         return is_duplicate(
-            article, corpus, tickers, similarity_threshold=self.similarity_threshold
+            article,
+            corpus,
+            tickers,
+            similarity_threshold=self.similarity_threshold,
+            known_assets=self.known_assets,
         )
 
     def process(
