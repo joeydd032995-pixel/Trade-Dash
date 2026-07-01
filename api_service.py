@@ -483,6 +483,35 @@ class DemoSeedResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class PersistAndPublishError(Exception):
+    """Raised by `_persist_and_publish` when persistence/publish fails
+    partway through a batch.
+
+    Review finding fixed here: previously, a raw driver exception
+    (Postgres/Redis) propagated straight out of `_persist_and_publish`,
+    surfacing as an opaque, unhandled 500 with no indication of which
+    events (if any) succeeded. Callers need `succeeded_events` to decide
+    what's actually safe to add to `UnifiedPipeline`'s in-memory store (see
+    `ingest_signals`, which now only calls `ingest_signal_events()` on the
+    events that are confirmed durable, instead of unconditionally adding
+    the whole batch before persistence is even attempted).
+    """
+
+    def __init__(
+        self,
+        succeeded_events: list[Event],
+        failed_event: Event,
+        cause: Exception,
+    ) -> None:
+        self.succeeded_events = succeeded_events
+        self.failed_event = failed_event
+        self.cause = cause
+        super().__init__(
+            f"persist/publish failed after {len(succeeded_events)} of "
+            f"{len(succeeded_events) + 1}+ events succeeded: {cause!r}"
+        )
+
+
 async def _persist_and_publish(
     events: list[Event],
     repository: EventRepository,
@@ -499,10 +528,68 @@ async def _persist_and_publish(
     transaction across events; each Event's insert+publish pair is
     independent, matching `events`' append-only, one-row-per-Event schema
     (no cross-event atomicity requirement exists here).
+
+    Raises `PersistAndPublishError` (not the raw driver exception) on any
+    failure, carrying `succeeded_events` so the caller can make an informed
+    decision about what's actually durable rather than assuming the whole
+    batch either fully succeeded or fully failed.
     """
+    succeeded: list[Event] = []
     for event in events:
-        await repository.insert_event(event)
-        await event_bus.publish_event(event)
+        try:
+            await repository.insert_event(event)
+            await event_bus.publish_event(event)
+        except Exception as exc:
+            raise PersistAndPublishError(
+                succeeded_events=succeeded, failed_event=event, cause=exc
+            ) from exc
+        succeeded.append(event)
+
+
+async def _persist_and_publish_or_502(
+    events: list[Event],
+    repository: EventRepository,
+    event_bus: EventBus,
+) -> list[Event]:
+    """Wraps `_persist_and_publish`, translating `PersistAndPublishError`
+    into an `HTTPException(502)` carrying partial-success accounting
+    (review finding: a raw Postgres/Redis exception used to surface as an
+    opaque, unhandled 500 with no way for the caller to tell "everything
+    failed" from "17 of 20 succeeded, don't blindly retry the first 17").
+
+    Returns the events that are CONFIRMED durable (persisted + published)
+    on success -- callers should only add this returned list to
+    `UnifiedPipeline`'s in-memory store, never the full input list
+    unconditionally, or the in-memory store can get ahead of what's
+    actually durable on a partial failure (see `ingest_signals`).
+    """
+    try:
+        await _persist_and_publish(events, repository, event_bus)
+    except PersistAndPublishError as exc:
+        logger.exception(
+            "persist/publish failed for asset=%r after %d/%d events "
+            "succeeded",
+            exc.failed_event.asset,
+            len(exc.succeeded_events),
+            len(events),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Failed to persist/publish one or more events to "
+                    "Postgres/Redis. This is an infrastructure failure, "
+                    "not a request-validation error -- do not blindly "
+                    "retry the full batch, since some events already "
+                    "succeeded."
+                ),
+                "total": len(events),
+                "succeeded_count": len(exc.succeeded_events),
+                "failed_asset": exc.failed_event.asset,
+                "succeeded_assets": [e.asset for e in exc.succeeded_events],
+            },
+        ) from exc
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +637,15 @@ class ConnectionRegistry:
         room, so a stuck client always eventually sees the most recent
         alerts once it recovers, rather than only ever seeing whatever was
         queued first.
+
+        NOTE (NFR-02 caveat): this satisfies "no dropped messages" only up
+        to `_CLIENT_QUEUE_MAXSIZE` payloads of backlog per client -- a
+        client that is merely slow (not stuck) but falls more than
+        `_CLIENT_QUEUE_MAXSIZE` payloads behind will lose the oldest
+        backlog entries rather than blocking the broadcaster. This is an
+        accepted Phase 1 trade-off (unbounded per-client backlog is a
+        memory-exhaustion risk); a real backpressure/ack scheme is Phase 2+
+        scope.
         """
         for queue in list(self._queues.values()):
             if queue.full():
@@ -575,6 +671,12 @@ class ConnectionRegistry:
             pass
         except Exception:
             logger.exception("WS client drain task failed; dropping connection")
+            # Review finding #2: without an explicit disconnect() here, a
+            # dead socket's queue/task entries would remain registered
+            # forever -- broadcast() would keep enqueueing into a queue
+            # nothing ever drains again (a silent alert black hole for this
+            # client) and client_count would over-report live connections.
+            await self.disconnect(websocket)
 
     @property
     def client_count(self) -> int:
@@ -854,7 +956,17 @@ def build_app(
             "persists every resulting Event to Postgres, and publishes each "
             "to the Redis `events` channel. Returns the Events produced "
             "(empty if every article was a duplicate or had no extractable "
-            "tickers)."
+            "tickers). NOTE: `UnifiedPipeline.ingest_articles()` computes "
+            "AND appends to the in-memory store as a single call (Step 5's "
+            "design) -- unlike `/ingest/signals`, a persist/publish failure "
+            "here cannot be prevented from leaving the affected Event(s) "
+            "visible in-memory (via GET /correlate*/GET /alerts) even "
+            "though they aren't yet durable. A 502 response's "
+            "`succeeded_assets`/`failed_asset` tells the caller exactly "
+            "which assets are affected so they can be reconciled/replayed "
+            "manually -- this asymmetry vs. /ingest/signals is a known, "
+            "accepted Phase 1 limitation of the append-only in-memory "
+            "design, not an oversight."
         ),
     )
     async def ingest_articles(
@@ -871,7 +983,7 @@ def build_app(
             for a in request.articles
         ]
         events = state.pipeline.ingest_articles(articles)
-        await _persist_and_publish(events, state.repository, state.event_bus)
+        await _persist_and_publish_or_502(events, state.repository, state.event_bus)
         return IngestResponse(
             count=len(events),
             events=[EventOut.from_event(e) for e in events],
@@ -898,8 +1010,41 @@ def build_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # Unlike /ingest/articles, SignalFactory-constructed Events don't
+        # require NLPPipeline's compute+append-in-one-call step, so this
+        # route CAN fully close the gap review finding #1 identified: only
+        # add the confirmed-durable subset to the in-memory pipeline, never
+        # the full input list unconditionally.
+        try:
+            await _persist_and_publish(events, state.repository, state.event_bus)
+        except PersistAndPublishError as exc:
+            if exc.succeeded_events:
+                state.pipeline.ingest_signal_events(exc.succeeded_events)
+            logger.exception(
+                "persist/publish failed for asset=%r after %d/%d events "
+                "succeeded",
+                exc.failed_event.asset,
+                len(exc.succeeded_events),
+                len(events),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "Failed to persist/publish one or more events to "
+                        "Postgres/Redis. This is an infrastructure failure, "
+                        "not a request-validation error -- do not blindly "
+                        "retry the full batch, since some events already "
+                        "succeeded."
+                    ),
+                    "total": len(events),
+                    "succeeded_count": len(exc.succeeded_events),
+                    "failed_asset": exc.failed_event.asset,
+                    "succeeded_assets": [e.asset for e in exc.succeeded_events],
+                },
+            ) from exc
+
         state.pipeline.ingest_signal_events(events)
-        await _persist_and_publish(events, state.repository, state.event_bus)
         return IngestResponse(
             count=len(events),
             events=[EventOut.from_event(e) for e in events],
@@ -994,13 +1139,43 @@ def build_app(
     async def demo_seed(state: AppState = Depends(get_state)) -> DemoSeedResponse:
         now = datetime.now(timezone.utc)
 
+        # Article path shares /ingest/articles' accepted asymmetry: NLPPipeline
+        # computes+appends to the in-memory store in one atomic call, so a
+        # persist/publish failure here can't be prevented from leaving the
+        # Event(s) visible in-memory despite not yet being durable.
         articles = _demo_articles(now)
         article_events = state.pipeline.ingest_articles(articles)
-        await _persist_and_publish(article_events, state.repository, state.event_bus)
+        await _persist_and_publish_or_502(article_events, state.repository, state.event_bus)
 
+        # Signal path mirrors /ingest/signals' fully-closed handling: only
+        # the confirmed-durable subset is added to the in-memory pipeline.
         signal_events = _demo_signal_events(now)
+        try:
+            await _persist_and_publish(signal_events, state.repository, state.event_bus)
+        except PersistAndPublishError as exc:
+            if exc.succeeded_events:
+                state.pipeline.ingest_signal_events(exc.succeeded_events)
+            logger.exception(
+                "demo_seed: persist/publish failed for asset=%r after "
+                "%d/%d signal events succeeded",
+                exc.failed_event.asset,
+                len(exc.succeeded_events),
+                len(signal_events),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "Failed to persist/publish one or more demo signal "
+                        "events to Postgres/Redis."
+                    ),
+                    "total": len(signal_events),
+                    "succeeded_count": len(exc.succeeded_events),
+                    "failed_asset": exc.failed_event.asset,
+                    "succeeded_assets": [e.asset for e in exc.succeeded_events],
+                },
+            ) from exc
         state.pipeline.ingest_signal_events(signal_events)
-        await _persist_and_publish(signal_events, state.repository, state.event_bus)
 
         all_events = article_events + signal_events
 

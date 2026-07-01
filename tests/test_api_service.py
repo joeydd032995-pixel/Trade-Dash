@@ -179,6 +179,23 @@ class FakeRedis:
 # ---------------------------------------------------------------------------
 
 
+class FlakyEventRepository(FakeEventRepository):
+    """`FakeEventRepository` that raises on the (fail_after+1)-th
+    `insert_event` call, simulating a Postgres failure partway through a
+    batch -- used to reproduce review finding #1 (the in-memory pipeline
+    must never get ahead of what's actually durable on a partial failure).
+    """
+
+    def __init__(self, fail_after: int) -> None:
+        super().__init__()
+        self._fail_after = fail_after
+
+    async def insert_event(self, event: Event) -> None:
+        if len(self.inserted) >= self._fail_after:
+            raise RuntimeError("simulated Postgres failure")
+        await super().insert_event(event)
+
+
 def make_event(**overrides) -> Event:
     defaults = dict(
         asset="BTC",
@@ -451,6 +468,155 @@ def test_ingest_articles_persists_to_repository_and_publishes_to_bus():
     assert n >= 1
     assert len(repository.inserted) == n
     assert len(published) == n
+
+
+# ---------------------------------------------------------------------------
+# Review finding #1: partial persist/publish failure must never let the
+# in-memory pipeline get ahead of what's actually durable
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_signals_partial_failure_returns_502_with_partial_accounting():
+    repository = FlakyEventRepository(fail_after=1)
+    app, repository, event_bus, pipeline = make_app(repository=repository)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/ingest/signals",
+            json={
+                "signals": [
+                    {
+                        "event_type": "whale_transfer",
+                        "asset": "BTC",
+                        "asset_class": "crypto",
+                        "direction": 1,
+                        "confidence": 0.9,
+                        "timestamp": "2026-07-01T12:00:00+00:00",
+                        "source": "arkham",
+                    },
+                    {
+                        "event_type": "whale_transfer",
+                        "asset": "ETH",
+                        "asset_class": "crypto",
+                        "direction": 1,
+                        "confidence": 0.9,
+                        "timestamp": "2026-07-01T12:00:00+00:00",
+                        "source": "arkham",
+                    },
+                ]
+            },
+        )
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["total"] == 2
+    assert detail["succeeded_count"] == 1
+    assert detail["failed_asset"] == "ETH"
+    assert detail["succeeded_assets"] == ["BTC"]
+
+
+def test_ingest_signals_partial_failure_only_pipeline_adds_confirmed_durable_subset():
+    """The confirmed-durable BTC event must be visible in-memory; the ETH
+    event that failed to persist/publish must NOT be, even though the
+    pipeline-add used to happen unconditionally before persistence was
+    attempted (review finding #1).
+    """
+    repository = FlakyEventRepository(fail_after=1)
+    app, repository, event_bus, pipeline = make_app(repository=repository)
+
+    with TestClient(app) as client:
+        client.post(
+            "/ingest/signals",
+            json={
+                "signals": [
+                    {
+                        "event_type": "whale_transfer",
+                        "asset": "BTC",
+                        "asset_class": "crypto",
+                        "direction": 1,
+                        "confidence": 0.9,
+                        "timestamp": "2026-07-01T12:00:00+00:00",
+                        "source": "arkham",
+                    },
+                    {
+                        "event_type": "whale_transfer",
+                        "asset": "ETH",
+                        "asset_class": "crypto",
+                        "direction": 1,
+                        "confidence": 0.9,
+                        "timestamp": "2026-07-01T12:00:00+00:00",
+                        "source": "arkham",
+                    },
+                ]
+            },
+        )
+
+    assert pipeline.correlate("BTC").signal_count == 1
+    assert pipeline.correlate("ETH").signal_count == 0
+
+
+def test_demo_seed_partial_signal_failure_returns_502_and_does_not_over_add_to_pipeline():
+    # 3 demo articles persist fine (fail_after only counts from the first
+    # insert_event call onward across BOTH the article and signal phases,
+    # so allow all 3 articles through, then fail on the very first signal).
+    repository = FlakyEventRepository(fail_after=3)
+    app, repository, event_bus, pipeline = make_app(repository=repository)
+    with TestClient(app) as client:
+        resp = client.post("/demo/seed")
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["succeeded_count"] == 0
+    assert detail["total"] == 6  # _demo_signal_events() produces 6 events
+
+    # None of the demo signal events should have reached the pipeline, since
+    # every single one failed to persist.
+    for asset in ("BTC", "SPY", "NVDA"):
+        result = pipeline.correlate(asset)
+        # Articles alone (no signals) shouldn't clear a directional
+        # signal_count derived from whale_transfer/options_flow/etc.
+        assert all(
+            weighted.event.event_type not in (
+                "whale_transfer", "funding_extreme", "options_flow",
+                "macro_event", "greek_anomaly", "insider_trade",
+            )
+            for weighted in result.weighted_signals
+        )
+
+
+# ---------------------------------------------------------------------------
+# Review finding #2: a WS client whose send fails must be deregistered, not
+# left as a stale queue/task entry that silently absorbs future alerts
+# ---------------------------------------------------------------------------
+
+
+class _FailingWebSocket:
+    """Minimal fake satisfying `ConnectionRegistry`'s WebSocket surface,
+    whose `send_json` always raises -- simulates a dead/broken socket.
+    """
+
+    async def accept(self) -> None:
+        pass
+
+    async def send_json(self, payload: dict) -> None:
+        raise RuntimeError("simulated dead socket")
+
+
+def test_drain_task_disconnects_client_when_send_fails():
+    async def _run() -> None:
+        registry = api.ConnectionRegistry()
+        ws = _FailingWebSocket()
+        await registry.connect(ws)
+        assert registry.client_count == 1
+
+        registry.broadcast({"asset": "BTC"})
+        # Give the background drain task a turn to run, hit the send
+        # failure, and deregister itself.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+
+        assert registry.client_count == 0
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
