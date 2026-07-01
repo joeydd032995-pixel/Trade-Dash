@@ -39,6 +39,36 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+
+class FrozenDict(dict):
+    """A `dict` subclass that raises on any attempt to mutate its contents.
+
+    Used for `Event.meta` so append-only (NFR-03/OQ-01) is a structural
+    guarantee, not just a convention. Deliberately a `dict` subclass rather
+    than `types.MappingProxyType`: a `MappingProxyType` is not deep-copyable
+    or picklable (`copy.deepcopy`/`dataclasses.asdict` raise
+    `TypeError: cannot pickle 'mappingproxy' object`), which would silently
+    break any future JSON serialization of `Event` (e.g. API responses,
+    WebSocket payloads). `FrozenDict` stays a true `dict` for `isinstance`
+    checks, `json.dumps`, and `dataclasses.asdict`, while still blocking
+    in-place mutation.
+    """
+
+    def _readonly(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError(
+            "Event.meta is immutable — construct a new Event (with "
+            "meta['correction_of'] = <original id>) instead of mutating "
+            "meta in place"
+        )
+
+    __setitem__ = _readonly
+    __delitem__ = _readonly
+    pop = _readonly
+    popitem = _readonly
+    update = _readonly
+    clear = _readonly
+    setdefault = _readonly
+
 # ---------------------------------------------------------------------------
 # Canonical enumerations
 # ---------------------------------------------------------------------------
@@ -129,7 +159,13 @@ class Event:
             observed.
         source: Origin identifier, e.g. "finnhub", "coinglass", "polygon".
         meta: Arbitrary JSONB-shaped type-specific payload. This is the
-            *only* place new, signal-type-specific data may live.
+            *only* place new, signal-type-specific data may live. Stored as
+            a `FrozenDict` (see `__post_init__`) — `frozen=True` alone only
+            blocks rebinding `event.meta = ...`, it does NOT stop in-place
+            mutation of a plain dict's *contents* (`event.meta["x"] = 1`
+            would otherwise succeed silently). A correction is always a new
+            `Event` with `meta["correction_of"] = <original event
+            id/fingerprint>`, never an in-place edit.
     """
 
     asset: str
@@ -182,6 +218,17 @@ class Event:
 
         if not isinstance(self.meta, dict):
             raise ValueError(f"Event.meta must be a dict; got {type(self.meta)!r}")
+
+        # Freeze the *contents* of meta, not just the Event's own attribute
+        # slot. `frozen=True` on the dataclass only prevents `event.meta =
+        # other_dict`; without this, `event.meta["x"] = 1` mutates the
+        # payload in place with no error, silently violating the append-only
+        # guarantee (NFR-03/OQ-01) that this class's docstring claims to
+        # enforce. `object.__setattr__` is required because the dataclass is
+        # frozen. `FrozenDict(self.meta)` also takes a defensive copy, so
+        # mutating the caller's original dict after construction can't
+        # retroactively change an already-constructed Event.
+        object.__setattr__(self, "meta", FrozenDict(self.meta))
 
 
 # ---------------------------------------------------------------------------
@@ -284,9 +331,26 @@ class NLPResult:
     duplicate_of: Optional[str] = None
 
     def __post_init__(self) -> None:
+        # Reject bool explicitly (bool is a subclass of int/float-coercible)
+        # before range-checking — mirrors Event.confidence/Event.direction's
+        # bool exclusion. Without this, `sentiment=True`/`urgency=True` pass
+        # the range check silently (True == 1, well within [-1,1]/[0,1]) and
+        # a literal bool ends up stored where a normalized float is expected.
+        if not isinstance(self.sentiment, (int, float)) or isinstance(
+            self.sentiment, bool
+        ):
+            raise ValueError(
+                f"NLPResult.sentiment must be a float in [-1.0, 1.0]; got {self.sentiment!r}"
+            )
         if not (-1.0 <= float(self.sentiment) <= 1.0):
             raise ValueError(
                 f"NLPResult.sentiment must be in [-1.0, 1.0]; got {self.sentiment!r}"
+            )
+        if not isinstance(self.urgency, (int, float)) or isinstance(
+            self.urgency, bool
+        ):
+            raise ValueError(
+                f"NLPResult.urgency must be a float in [0.0, 1.0]; got {self.urgency!r}"
             )
         if not (0.0 <= float(self.urgency) <= 1.0):
             raise ValueError(
@@ -302,6 +366,7 @@ __all__ = [
     "Event",
     "Article",
     "NLPResult",
+    "FrozenDict",
     "VALID_DIRECTIONS",
     "ASSET_CLASSES",
     "NON_NEWS_EVENT_TYPES",

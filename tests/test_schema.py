@@ -261,3 +261,72 @@ class TestLiveSchemaApply:
                 await conn.close()
 
         asyncio.run(_run())
+
+    def test_articles_table_survives_when_vector_extension_unavailable(
+        self, schema_sql
+    ):
+        """Regression test for a real defect found in review: applying
+        schema.sql via `psql -f` (which does not stop on error by default)
+        on a Postgres WITHOUT the `vector` extension used to silently drop
+        the entire `articles` table (plus every index on it) while still
+        exiting 0 — because the old unguarded `CREATE EXTENSION vector` and
+        the unconditional `embedding vector(384)` column both errored
+        mid-script and `psql -f` just kept going. Unlike
+        `test_apply_schema_and_verify_tables` above (which pre-installs
+        `vector` and skips entirely if that's unavailable), THIS test
+        deliberately does NOT install `vector` first — it applies schema.sql
+        exactly as a plain-Postgres developer would, and asserts `articles`
+        (and every other table) still exists, just without the `embedding`
+        column.
+        """
+        import asyncio
+
+        async def _run():
+            import asyncpg
+
+            conn = await asyncpg.connect(dsn=DATABASE_URL)
+            try:
+                has_vector = await conn.fetchval(
+                    "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+                )
+                if has_vector:
+                    pytest.skip(
+                        "vector extension is already installed on this "
+                        "reachable Postgres — this test specifically checks "
+                        "behavior when it is NOT installed"
+                    )
+
+                await conn.execute(schema_sql)
+                rows = await conn.fetch(
+                    """
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    """
+                )
+                found = {r["table_name"] for r in rows}
+                missing = EXPECTED_TABLES - found
+                assert not missing, (
+                    f"Tables missing after applying schema.sql without the "
+                    f"vector extension installed: {missing} -- this is the "
+                    f"exact regression this test guards against"
+                )
+
+                cols = await conn.fetch(
+                    """
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'articles'
+                    """
+                )
+                col_names = {r["column_name"] for r in cols}
+                assert "embedding" not in col_names, (
+                    "articles.embedding should not exist when the vector "
+                    "extension isn't installed"
+                )
+                assert "fingerprint" in col_names and "headline" in col_names, (
+                    "articles' non-vector columns must still exist"
+                )
+            finally:
+                await conn.execute("DROP TABLE IF EXISTS " + ", ".join(EXPECTED_TABLES) + " CASCADE")
+                await conn.close()
+
+        asyncio.run(_run())

@@ -176,6 +176,25 @@ def test_event_meta_must_be_a_dict():
         make_event(meta=["not", "a", "dict"])  # type: ignore[arg-type]
 
 
+def test_event_meta_contents_are_immutable_not_just_the_attribute():
+    # frozen=True alone only blocks `event.meta = other_dict`; the contents
+    # of the dict itself must also be protected, or a caller could silently
+    # mutate historical event data in place (violating NFR-03/OQ-01
+    # append-only) with no error at all.
+    ev = make_event(meta={"amount_usd": 5_000_000})
+    with pytest.raises(TypeError):
+        ev.meta["amount_usd"] = 1  # type: ignore[index]
+
+
+def test_event_meta_original_dict_passed_in_is_not_aliased():
+    # Mutating the caller's original dict after construction must not affect
+    # the already-constructed Event — the Event must hold its own snapshot.
+    original = {"amount_usd": 5_000_000}
+    ev = make_event(meta=original)
+    original["amount_usd"] = 1
+    assert ev.meta["amount_usd"] == 5_000_000
+
+
 # ---------------------------------------------------------------------------
 # Article
 # ---------------------------------------------------------------------------
@@ -324,6 +343,35 @@ def test_nlpresult_sentiment_out_of_range_raises(bad_sentiment):
 
 @pytest.mark.parametrize("bad_urgency", [-0.1, 1.1, 2.0])
 def test_nlpresult_urgency_out_of_range_raises(bad_urgency):
+    art = make_article()
+    with pytest.raises(ValueError):
+        NLPResult(
+            article=art,
+            tickers=["BTC"],
+            sentiment=0.0,
+            topic="on_chain",
+            urgency=bad_urgency,
+        )
+
+
+@pytest.mark.parametrize("bad_sentiment", [True, False])
+def test_nlpresult_sentiment_rejects_bool(bad_sentiment):
+    # bool is a subclass of int and would otherwise pass the [-1,1] range
+    # check silently (True == 1, False == 0) — mirrors Event.direction's/
+    # Event.confidence's explicit bool exclusion.
+    art = make_article()
+    with pytest.raises(ValueError):
+        NLPResult(
+            article=art,
+            tickers=["BTC"],
+            sentiment=bad_sentiment,
+            topic="on_chain",
+            urgency=0.5,
+        )
+
+
+@pytest.mark.parametrize("bad_urgency", [True, False])
+def test_nlpresult_urgency_rejects_bool(bad_urgency):
     art = make_article()
     with pytest.raises(ValueError):
         NLPResult(

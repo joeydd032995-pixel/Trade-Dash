@@ -22,14 +22,47 @@
 -- -----------------------------------------------------------------------------
 -- pgvector: NOTE the extension is named `vector`, not `pgvector` — a common
 -- copy-paste mistake (AD-08, database-schema-expert notes).
-CREATE EXTENSION IF NOT EXISTS vector;
+--
+-- Guarded via DO block, NOT a bare `CREATE EXTENSION IF NOT EXISTS vector;`.
+-- Reviewer finding: `psql -f` does not stop on error by default (no
+-- `ON_ERROR_STOP`), so an unguarded `CREATE EXTENSION vector` on a plain
+-- Postgres without the extension binary would error, print to scrollback,
+-- and keep going — silently dropping the ENTIRE `articles` table and every
+-- index on it (confirmed empirically against a real Postgres 16 with no
+-- vector extension installed: exit code 0, `articles` simply missing). Since
+-- `articles` is required Phase 1 infrastructure (FR-01/FR-03/FR-04), not an
+-- optional forward-compat feature, this must degrade gracefully rather than
+-- silently corrupt the schema. The `embedding` column/index (Phase 2,
+-- semantic dedup) are added conditionally further below, only if this
+-- extension actually installs.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_available_extensions WHERE name = 'vector'
+    ) THEN
+        EXECUTE 'CREATE EXTENSION IF NOT EXISTS vector';
+    ELSE
+        RAISE NOTICE 'vector extension not available — articles.embedding and its ivfflat index will be skipped (Phase 2 semantic dedup will be unavailable until pgvector is installed)';
+    END IF;
+END
+$$;
 
 -- TimescaleDB: required for hypertables (events.ts) and compression policies
 -- (OQ-06). Installed via the timescale/timescaledb-ha Docker image per
 -- CLAUDE.md §6 Infrastructure. Guarded below with pg_extension checks so this
 -- script does not hard-fail in environments where TimescaleDB isn't present
 -- yet (e.g. plain PostgreSQL during early local development).
-CREATE EXTENSION IF NOT EXISTS timescaledb;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'
+    ) THEN
+        EXECUTE 'CREATE EXTENSION IF NOT EXISTS timescaledb';
+    ELSE
+        RAISE NOTICE 'timescaledb extension not available — hypertable/compression setup below will be skipped';
+    END IF;
+END
+$$;
 
 
 -- -----------------------------------------------------------------------------
@@ -60,10 +93,13 @@ CREATE INDEX IF NOT EXISTS idx_assets_tags ON assets USING GIN (tags);
 -- -----------------------------------------------------------------------------
 -- Rationale: FR-03 requires MD5 fingerprint dedup; FR-04 requires per-article
 -- ticker/sentiment/topic/urgency extraction results to be persisted.
--- `embedding vector(384)` is added now for forward-compatibility with the
--- Phase 2 semantic-dedup swap (AD-06: sentence-transformers/all-MiniLM-L6-v2,
--- 384-dim output) — the column exists today but Phase 1 application code
--- does not populate or query it yet.
+--
+-- NOTE: `embedding vector(384)` is intentionally NOT in this CREATE TABLE.
+-- It's added conditionally below (only if the `vector` extension actually
+-- installed) so that table creation for `articles` — required Phase 1
+-- infrastructure — never depends on pgvector being present. See the
+-- Extensions section above for why an unconditional `vector` column here
+-- was a real bug (silently dropped the whole table on plain Postgres).
 CREATE TABLE IF NOT EXISTS articles (
     id              BIGSERIAL PRIMARY KEY,
     fingerprint     TEXT NOT NULL,               -- MD5 hash for exact-dedup (FR-03)
@@ -78,7 +114,6 @@ CREATE TABLE IF NOT EXISTS articles (
     sentiment       DOUBLE PRECISION,               -- normalized sentiment score
     topic           TEXT,
     urgency         DOUBLE PRECISION,
-    embedding       vector(384),                    -- Phase 2: semantic dedup (AD-06)
     raw_payload     JSONB,                           -- NFR-03: store raw payload for audit/replay
     UNIQUE (fingerprint)
 );
@@ -87,13 +122,29 @@ CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles (published_at D
 CREATE INDEX IF NOT EXISTS idx_articles_tickers ON articles USING GIN (tickers);
 CREATE INDEX IF NOT EXISTS idx_articles_source ON articles (source);
 
--- Vector similarity index for semantic dedup (Phase 2 consumer:
--- nlp-pipeline-expert). ivfflat requires the table to have rows to build an
--- efficient index in production; safe to create against an empty table too.
--- Use vector_cosine_ops per AD-08 / database-schema-expert guidance.
-CREATE INDEX IF NOT EXISTS idx_articles_embedding_ivfflat
-    ON articles USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- `embedding vector(384)` for forward-compatibility with the Phase 2
+-- semantic-dedup swap (AD-06: sentence-transformers/all-MiniLM-L6-v2,
+-- 384-dim output) — the column exists once pgvector is installed, but Phase
+-- 1 application code does not populate or query it yet. Added + indexed only
+-- if the `vector` extension actually installed above (pg_extension, not just
+-- pg_available_extensions — we want "did it install," not "could it").
+-- ivfflat requires the table to have rows to build an efficient index in
+-- production; safe to create against an empty table too. vector_cosine_ops
+-- per AD-08 / database-schema-expert guidance.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        EXECUTE 'ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding vector(384)';
+        EXECUTE '
+            CREATE INDEX IF NOT EXISTS idx_articles_embedding_ivfflat
+                ON articles USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+        ';
+    ELSE
+        RAISE NOTICE 'vector extension not installed — articles.embedding column and its ivfflat index were skipped';
+    END IF;
+END
+$$;
 
 
 -- -----------------------------------------------------------------------------
