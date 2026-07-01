@@ -1,5 +1,11 @@
+# Dev/test-only dependencies. Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
 pytest
 pytest-asyncio
 aioresponses
 sqlparse
 asyncpg
+# fastapi.testclient.TestClient (tests/test_api_service.py) is httpx-based
+# but FastAPI/Starlette don't declare httpx as an install dependency --
+# pin it explicitly so a fresh environment can actually run the test suite.
+httpx

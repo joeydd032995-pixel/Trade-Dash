@@ -1,0 +1,94 @@
+# Trade-Dash Phase 1 (MMP v1.0) local dev stack: Postgres/TimescaleDB/
+# pgvector, Redis, the FastAPI API service, and the event_bus poller/alert
+# process. Matches CLAUDE.md §6's Quick Start sequence: after
+# `docker-compose up`, `schema.sql` has already been applied (via the
+# postgres service's docker-entrypoint-initdb.d mount) and the API is
+# reachable at http://localhost:8000.
+#
+# NOTE: this compose file could not be literally executed in the sandbox
+# this repo was originally built in (the Docker daemon was unreachable
+# there — see Step 10's local apt-based Postgres/Redis verification spike
+# for the actual executed verification of schema.sql and the restart-
+# durability path). It has been reviewed for correctness against
+# TimescaleDB's documented compatibility with the official postgres
+# image's env vars / docker-entrypoint-initdb.d convention, but has not
+# been run end-to-end via `docker-compose up` — verify on first real use.
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trade_dash}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trade_dash}
+      POSTGRES_DB: ${POSTGRES_DB:-trade_dash}
+    ports:
+      - "5432:5432"
+    volumes:
+      - trade_dash_postgres_data:/var/lib/postgresql/data
+      # schema.sql is guarded (pg_available_extensions checks around both
+      # `CREATE EXTENSION vector` and `CREATE EXTENSION timescaledb`), so
+      # it's safe to run unattended via docker-entrypoint-initdb.d even if
+      # an extension is unexpectedly unavailable in a given image tag.
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-trade_dash} -d $${POSTGRES_DB:-trade_dash}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - trade_dash_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override any DATABASE_URL/REDIS_URL from .env with the in-network
+      # service hostnames -- .env is written for host-machine (non-Docker)
+      # use, where postgres/redis are reachable via localhost instead.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trade_dash}:${POSTGRES_PASSWORD:-trade_dash}@postgres:5432/${POSTGRES_DB:-trade_dash}
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "api_service:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  event_bus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trade_dash}:${POSTGRES_PASSWORD:-trade_dash}@postgres:5432/${POSTGRES_DB:-trade_dash}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "event_bus.py"]
+
+volumes:
+  trade_dash_postgres_data:
+  trade_dash_redis_data:
