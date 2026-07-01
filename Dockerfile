@@ -8,6 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# freshness_guard.py isn't imported by any Phase 1 module yet (CLAUDE.md
+# §7's "wire freshness_guard.py into the scoring job" TODO is still open)
+# -- copied now so it's already in the image once that wiring lands.
 COPY event_types.py nlp_pipeline.py correlation_scorer.py unified_pipeline.py \
      event_bus.py freshness_guard.py api_service.py ./
 

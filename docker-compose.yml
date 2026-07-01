@@ -16,7 +16,18 @@
 
 services:
   postgres:
-    image: timescale/timescaledb-ha:pg16
+    # Deliberately the plain (non-HA) `timescale/timescaledb` image, not
+    # `timescale/timescaledb-ha`. The `-ha` variant is Timescale's
+    # Patroni/pgBackRest-oriented image built for HA clustering, whose
+    # data directory convention is not confirmed to match the official
+    # postgres image's `/var/lib/postgresql/data` -- using it here risked
+    # silently mounting the volume at the wrong path (data loss on every
+    # container restart, invisible until the first restart). This plain
+    # image is documented as a drop-in for the official `postgres` image
+    # (same PGDATA, same docker-entrypoint-initdb.d support) while still
+    # bundling TimescaleDB + pgvector, which is all Phase 1 needs -- no
+    # HA/Patroni failover is needed for a single-node local dev stack.
+    image: timescale/timescaledb:latest-pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-trade_dash}
