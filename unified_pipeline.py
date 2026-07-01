@@ -615,6 +615,20 @@ class UnifiedPipeline:
     or removes a previously stored `Event` (NFR-03) — `ingest_articles()`
     and `ingest_signal_events()` only ever append.
 
+    KNOWN LIMITATION, tracked explicitly for Step 7 (review finding, not
+    fixed here since the real fix is the DB-backed rewrite this class is
+    already scheduled to be replaced by): `self._articles` grows unbounded
+    for the lifetime of an instance, and every `ingest_articles()` call
+    dedup-scans the FULL accumulated corpus (`NLPPipeline.process()`'s
+    tier-2 near-dupe check re-extracts tickers per candidate). This is
+    algorithmically O(n) per call / effectively O(n²) across a session, not
+    just "needs a database" — moving storage to Postgres alone won't fix
+    this unless the dedup query itself becomes bounded/windowed or indexed
+    (e.g. only scan recent articles sharing a ticker, per the `nlp-pipeline`
+    skill's own scoping guidance, rather than "every article ever seen").
+    Step 7 should redesign the dedup-scope query, not just relocate this
+    same full-scan loop to SQL.
+
     This class contains zero scoring logic — `correlate()`/`correlate_all()`/
     `alert_payloads()` all delegate to `CorrelationScorer`, which is the only
     place the confluence formula (AD-04) lives. If a future change requires
@@ -623,7 +637,11 @@ class UnifiedPipeline:
     `correlation_scorer.py`, not here.
     """
 
-    def __init__(self, scorer: Optional[CorrelationScorer] = None) -> None:
+    def __init__(
+        self,
+        scorer: Optional[CorrelationScorer] = None,
+        crypto_tickers: Optional[set[str]] = None,
+    ) -> None:
         self._scorer = scorer if scorer is not None else CorrelationScorer()
         self._events: list[Event] = []
         # Accumulates every Article ever passed to ingest_articles (whether
@@ -635,6 +653,13 @@ class UnifiedPipeline:
         # call — that argument is *added to*, not replaced by, this internal
         # accumulation (see `ingest_articles` docstring).
         self._articles: list[Article] = []
+        # Overridable crypto-symbol allowlist for `_infer_asset_class` (see
+        # that function's docstring for why this needs to be overridable —
+        # review finding: a fixed small default silently misclassifies any
+        # crypto ticker outside it, corrupting half-life selection).
+        self._crypto_tickers = (
+            frozenset(crypto_tickers) if crypto_tickers is not None else None
+        )
 
     # -- accessors --------------------------------------------------------
 
@@ -720,7 +745,7 @@ class UnifiedPipeline:
             for ticker in result.tickers:
                 event = Event(
                     asset=ticker,
-                    asset_class=_infer_asset_class(ticker),
+                    asset_class=_infer_asset_class(ticker, self._crypto_tickers),
                     event_type="news",
                     direction=direction,
                     confidence=confidence,
@@ -885,18 +910,39 @@ class UnifiedPipeline:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-#: Minimal crypto-symbol allowlist used only to infer `asset_class` for
+#: Default crypto-symbol allowlist used to infer `asset_class` for
 #: news-derived Events, since `NLPResult`/`Article` carry no asset_class of
 #: their own (news articles mention tickers across asset classes freely).
-#: This mirrors `nlp_pipeline.DEFAULT_KNOWN_ASSETS`'s crypto subset; kept
-#: local (not imported) since this is a UnifiedPipeline-only concern (asset
-#: class inference for Event construction), not an NLP concern.
+#: Kept local (not imported from nlp_pipeline) since this is a
+#: UnifiedPipeline-only concern (asset class inference for Event
+#: construction), not an NLP concern.
+#:
+#: Review finding fixed here: a smaller 10-symbol version of this set
+#: silently misclassified any crypto ticker outside it (e.g. SHIB, PEPE,
+#: ARB, UNI, AAVE, LTC, ATOM, NEAR) as "equity", which routes the resulting
+#: news Event through correlation_scorer.get_half_life_minutes("equity") ->
+#: 180-minute half-life instead of the correct 90-minute crypto half-life
+#: (AD-03/OQ-02) -- a real, demonstrated confluence-score distortion, not
+#: just a cosmetic mislabel. Expanded to a much broader real-world set AND
+#: made overridable per-instance (see `UnifiedPipeline.__init__`'s
+#: `crypto_tickers` parameter) so a caller with a live, larger universe
+#: (e.g. once Step 7 wires the `assets` table) isn't stuck with this
+#: hardcoded default.
 _CRYPTO_TICKERS = frozenset(
-    {"BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC"}
+    {
+        "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT",
+        "MATIC", "SHIB", "PEPE", "ARB", "OP", "SUI", "APT", "TON", "BNB",
+        "TRX", "LTC", "ATOM", "NEAR", "FIL", "ICP", "UNI", "AAVE", "MKR",
+        "CRV", "LDO", "RUNE", "INJ", "TIA", "SEI", "STX", "IMX", "GRT",
+        "SAND", "MANA", "AXS", "FTM", "ALGO", "XLM", "HBAR", "VET", "EGLD",
+        "XMR", "ETC", "BCH", "USDT", "USDC", "DAI",
+    }
 )
 
 
-def _infer_asset_class(ticker: str) -> str:
+def _infer_asset_class(
+    ticker: str, crypto_tickers: Optional[frozenset[str]] = None
+) -> str:
     """Infer `Event.asset_class` for a news-derived ticker.
 
     Defaults to "equity" for anything not in the known crypto set — a
@@ -905,9 +951,17 @@ def _infer_asset_class(ticker: str) -> str:
     `correlation_scorer.get_half_life_minutes` for any asset_class it
     doesn't explicitly recognize as "crypto". In production this should be
     replaced by a lookup against the `assets` table (schema.sql), which
-    carries a real `asset_class` column per symbol.
+    carries a real `asset_class` column per symbol -- this remains a
+    documented stopgap, not a permanent design, even after the expanded
+    default set above.
+
+    Args:
+        ticker: The ticker symbol to classify.
+        crypto_tickers: Override allowlist. Falls back to the module-level
+            `_CRYPTO_TICKERS` default if omitted.
     """
-    return "crypto" if ticker in _CRYPTO_TICKERS else "equity"
+    allowlist = crypto_tickers if crypto_tickers is not None else _CRYPTO_TICKERS
+    return "crypto" if ticker in allowlist else "equity"
 
 
 __all__ = [

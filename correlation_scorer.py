@@ -173,7 +173,23 @@ class CorrelationResult:
             exact tie-breaking convention used when C == 0 or d_i == 0).
         conflict_ratio: Fraction of signals whose direction opposes the
             overall sign of `confluence_score`.
-        signal_count: Total number of Events considered for this asset.
+        signal_count: Number of Events considered for this asset that assert
+            an actual directional stance (`direction != 0`) — i.e. the count
+            used to gate FR-19's `signal_count >= min_signals` alerting
+            requirement, which is meant to require multiple *corroborating*
+            signals, not merely multiple Events. A `direction == 0` (neutral)
+            Event — however high its `confidence`/`weight` — asserts no
+            directional evidence and must not be able to satisfy this gate
+            on its own (review finding: a single direction-neutral,
+            urgency-only news Event could previously pad `signal_count` from
+            2 to 3 and flip an alert from blocked to firing, despite
+            contributing nothing directional). `weighted_signals` still
+            contains the FULL audit trail including neutral-direction
+            Events — this field only affects the *count* used for gating,
+            never what's recorded or how `confluence_score` itself is
+            computed (AD-04's formula is unchanged: a neutral Event still
+            legitimately dilutes the denominator, since "I read this and
+            it's genuinely unclear" is real information about conviction).
     """
 
     asset: str
@@ -287,13 +303,21 @@ class CorrelationScorer:
             weighted_signals, confluence_score
         )
 
+        # signal_count deliberately excludes direction == 0 (neutral) Events
+        # — see CorrelationResult.signal_count's docstring. This does NOT
+        # affect confluence_score/weighted_signals: neutral Events are still
+        # fully included in the formula and the audit trail above.
+        directional_signal_count = sum(
+            1 for ev in asset_events if ev.direction != 0
+        )
+
         return CorrelationResult(
             asset=asset,
             confluence_score=confluence_score,
             weighted_signals=weighted_signals,
             agreement_ratio=agreement_ratio,
             conflict_ratio=conflict_ratio,
-            signal_count=len(asset_events),
+            signal_count=directional_signal_count,
         )
 
 

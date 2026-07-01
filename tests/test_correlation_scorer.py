@@ -357,6 +357,38 @@ def test_all_zero_confidence_events_return_zero_without_raising():
     assert len(result.weighted_signals) == 1
 
 
+def test_signal_count_excludes_direction_neutral_events():
+    # Regression: signal_count used to be len(asset_events), so a
+    # direction=0 (neutral) event -- however high its confidence -- could
+    # pad signal_count toward FR-19's min_signals gate despite asserting no
+    # directional evidence. Two directional events + one neutral event must
+    # report signal_count == 2, not 3.
+    directional_a = make_event(direction=1, confidence=0.9, timestamp=NOW)
+    directional_b = make_event(direction=1, confidence=0.9, timestamp=NOW)
+    neutral_padding = make_event(
+        direction=0, confidence=0.3, event_type="news", timestamp=NOW
+    )
+    scorer = CorrelationScorer()
+    result = scorer.correlate(
+        "BTC", [directional_a, directional_b, neutral_padding], now=NOW
+    )
+    assert result.signal_count == 2
+
+    # The neutral event is still fully present in the audit trail and still
+    # legitimately participates in the confluence formula itself (diluting
+    # the denominator) -- only the signal_count *gate* excludes it.
+    assert len(result.weighted_signals) == 3
+
+
+def test_signal_count_with_only_neutral_events_is_zero():
+    neutral_a = make_event(direction=0, confidence=0.5, timestamp=NOW)
+    neutral_b = make_event(direction=0, confidence=0.3, timestamp=NOW)
+    scorer = CorrelationScorer()
+    result = scorer.correlate("BTC", [neutral_a, neutral_b], now=NOW)
+    assert result.signal_count == 0
+    assert len(result.weighted_signals) == 2
+
+
 def test_correlate_filters_by_asset():
     btc_event = make_event(asset="BTC", timestamp=NOW)
     eth_event = make_event(asset="ETH", timestamp=NOW)

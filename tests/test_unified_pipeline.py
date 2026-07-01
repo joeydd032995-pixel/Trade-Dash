@@ -284,6 +284,40 @@ def test_ingest_articles_direction_mapping_neutral_for_no_sentiment_words():
     assert events[0].direction == 0
 
 
+def test_infer_asset_class_recognizes_expanded_crypto_set():
+    # Regression: the original 10-symbol crypto allowlist misclassified any
+    # crypto ticker outside it (e.g. SHIB, PEPE, ARB, UNI) as "equity",
+    # which corrupts correlation_scorer's half-life selection (180min
+    # instead of the correct 90min). These are now in the expanded default.
+    assert up._infer_asset_class("SHIB") == "crypto"
+    assert up._infer_asset_class("PEPE") == "crypto"
+    assert up._infer_asset_class("ARB") == "crypto"
+    assert up._infer_asset_class("UNI") == "crypto"
+    # A genuine equity ticker still classifies correctly.
+    assert up._infer_asset_class("NVDA") == "equity"
+
+
+def test_unified_pipeline_crypto_tickers_override_is_threaded_through_ingest_articles():
+    # Proves the crypto_tickers constructor override actually reaches
+    # ingest_articles's Event construction, not just _infer_asset_class in
+    # isolation. "MATIC" is in nlp_pipeline's default ticker allowlist AND
+    # in unified_pipeline's default crypto set; overriding crypto_tickers to
+    # exclude it must flip its inferred asset_class to "equity".
+    default_pipeline = UnifiedPipeline()
+    article = make_article(
+        headline="MATIC surges on strong network growth",
+        body="MATIC surged today after strong on-chain growth.",
+    )
+    default_events = default_pipeline.ingest_articles([article])
+    assert len(default_events) == 1
+    assert default_events[0].asset_class == "crypto"
+
+    overridden_pipeline = UnifiedPipeline(crypto_tickers={"SOMETHING_ELSE"})
+    overridden_events = overridden_pipeline.ingest_articles([article])
+    assert len(overridden_events) == 1
+    assert overridden_events[0].asset_class == "equity"
+
+
 def test_ingest_articles_meta_contains_nlp_fields_not_new_toplevel_fields():
     pipeline = UnifiedPipeline()
     article = make_article()
