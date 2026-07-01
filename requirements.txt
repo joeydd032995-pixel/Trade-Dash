@@ -11,3 +11,9 @@ redis
 # keep the test suite green until aioresponses publishes a 3.10+-compatible
 # release.
 aiohttp<3.10
+# api_service.py (Step 7) -- FastAPI REST + WebSocket service, pydantic v2
+# request/response models, asyncpg for the DB-backed event store.
+fastapi
+uvicorn[standard]
+pydantic>=2
+asyncpg
