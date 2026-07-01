@@ -1,1 +1,13 @@
 numpy
+# redis-py >=4.2 bundles asyncio support (redis.asyncio) natively -- the
+# "redis[asyncio]" extra from CLAUDE.md §6's Quick Start is a no-op / raises
+# a pip warning on modern redis-py versions (it existed for the older,
+# separate `aioredis`-merge transition period). Plain `redis` is correct now.
+redis
+# Pinned <3.10: aioresponses 0.7.9 (requirements-dev.txt) does not support
+# aiohttp's ClientResponse signature from 3.10+ (missing `stream_writer` kw)
+# -- see tests/test_event_bus.py's HTTP-mocking notes. event_bus.py's own
+# code has no version-specific aiohttp usage; this pin exists purely to
+# keep the test suite green until aioresponses publishes a 3.10+-compatible
+# release.
+aiohttp<3.10
